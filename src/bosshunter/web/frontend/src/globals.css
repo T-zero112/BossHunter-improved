@@ -1,0 +1,107 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --background: 27 100% 97%;
+  --foreground: 0 0% 12%;
+  --card: 0 0% 100%;
+  --card-foreground: 0 0% 12%;
+  --popover: 0 0% 100%;
+  --popover-foreground: 0 0% 12%;
+  --primary: 20 97% 53%;
+  --primary-foreground: 0 0% 100%;
+  --secondary: 25 100% 95%;
+  --secondary-foreground: 0 0% 12%;
+  --muted: 25 18% 43%;
+  --muted-foreground: 25 18% 43%;
+  --accent: 25 100% 95%;
+  --accent-foreground: 20 97% 53%;
+  --destructive: 4 76% 57%;
+  --destructive-foreground: 0 0% 100%;
+  --border: 27 35% 91%;
+  --input: 27 35% 91%;
+  --ring: 20 97% 53%;
+  --radius: 0.75rem;
+}
+
+* {
+  border-color: hsl(var(--border));
+}
+
+body {
+  background-color: #FFF7F0;
+  color: #1F1F1F;
+  font-family: Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Microsoft YaHei', sans-serif;
+}
+
+/* Scrollbar styling */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: #FFF0E5;
+}
+::-webkit-scrollbar-thumb {
+  background: #F2C7AA;
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #FB6511;
+}
+
+.rich-text-editor:empty::before {
+  pointer-events: none;
+}
+
+.rich-text-editor,
+.rich-text-content {
+  word-break: break-word;
+}
+
+.rich-text-editor div,
+.rich-text-editor p,
+.rich-text-content div,
+.rich-text-content p {
+  margin: 0 0 0.25rem;
+}
+
+.rich-text-editor h2,
+.rich-text-content h2 {
+  margin: 0.25rem 0;
+  font-size: 1rem;
+  font-weight: 800;
+}
+
+.rich-text-editor h3,
+.rich-text-content h3 {
+  margin: 0.25rem 0;
+  font-size: 0.95rem;
+  font-weight: 800;
+}
+
+.rich-text-editor ul,
+.rich-text-editor ol,
+.rich-text-content ul,
+.rich-text-content ol {
+  margin: 0.25rem 0;
+  padding-left: 1.25rem;
+}
+
+.rich-text-editor ul,
+.rich-text-content ul {
+  list-style: disc;
+}
+
+.rich-text-editor ol,
+.rich-text-content ol {
+  list-style: decimal;
+}
+
+.rich-text-editor img,
+.rich-text-content img {
+  max-width: 100%;
+  max-height: 8rem;
+  object-fit: contain;
+}

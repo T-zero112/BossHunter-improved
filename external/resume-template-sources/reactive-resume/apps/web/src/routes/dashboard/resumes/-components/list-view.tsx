@@ -1,0 +1,151 @@
+import type { RouterOutput } from "@/libs/orpc/client";
+import { useLingui } from "@lingui/react";
+import { Trans } from "@lingui/react/macro";
+import { DotsThreeIcon, DownloadSimpleIcon, PlusIcon } from "@phosphor-icons/react";
+import { Link } from "@tanstack/react-router";
+import { AnimatePresence, m } from "motion/react";
+import { useMemo } from "react";
+import { Button } from "@reactive-resume/ui/components/button";
+import { useDialogStore } from "@/dialogs/store";
+import { ResumeDropdownMenu } from "./menus/dropdown-menu";
+
+type Resume = RouterOutput["resume"]["list"][number];
+
+type ListViewProps = {
+	resumes: Resume[];
+	hasResumes: boolean;
+};
+
+type ResumeListItemProps = {
+	resume: Resume;
+};
+
+export function ListView({ resumes, hasResumes }: ListViewProps) {
+	const { openDialog } = useDialogStore();
+
+	if (resumes.length === 0 && hasResumes) {
+		return (
+			<p className="py-8 text-center text-muted-foreground text-sm">
+				<Trans>No resumes match your search.</Trans>
+			</p>
+		);
+	}
+
+	if (resumes.length === 0) {
+		const handleCreateResume = () => {
+			openDialog("resume.create", undefined);
+		};
+
+		const handleImportResume = () => {
+			openDialog("resume.import", undefined);
+		};
+
+		return (
+			<div className="flex flex-col gap-y-1">
+				<m.div
+					className="will-change-[transform,opacity]"
+					initial={{ opacity: 0, y: -20 }}
+					animate={{ opacity: 1, y: 0 }}
+					exit={{ opacity: 0, y: -20 }}
+					transition={{ duration: 0.2, ease: "easeOut" }}
+				>
+					<Button
+						size="lg"
+						variant="ghost"
+						className="h-12 w-full justify-start gap-x-4 text-start"
+						onClick={handleCreateResume}
+					>
+						<PlusIcon />
+						<div className="min-w-0 flex-1 truncate">
+							<Trans>Create a new resume</Trans>
+						</div>
+
+						<p className="hidden text-xs opacity-60 sm:block">
+							<Trans>Start building your resume from scratch</Trans>
+						</p>
+					</Button>
+				</m.div>
+
+				<m.div
+					className="will-change-[transform,opacity]"
+					initial={{ opacity: 0, y: -20 }}
+					animate={{ opacity: 1, y: 0 }}
+					exit={{ opacity: 0, y: -20 }}
+					transition={{ duration: 0.2, delay: 0.03, ease: "easeOut" }}
+				>
+					<Button
+						size="lg"
+						variant="ghost"
+						className="h-12 w-full justify-start gap-x-4 text-start"
+						onClick={handleImportResume}
+					>
+						<DownloadSimpleIcon />
+
+						<div className="min-w-0 flex-1 truncate">
+							<Trans>Import an existing resume</Trans>
+						</div>
+
+						<p className="hidden text-xs opacity-60 sm:block">
+							<Trans>Continue where you left off</Trans>
+						</p>
+					</Button>
+				</m.div>
+			</div>
+		);
+	}
+
+	return (
+		<div className="flex flex-col gap-y-1">
+			<AnimatePresence initial={false} mode="popLayout">
+				{resumes.map((resume, index) => (
+					<m.div
+						layout
+						key={resume.id}
+						className="will-change-[transform,opacity]"
+						initial={{ opacity: 0, y: -20 }}
+						animate={{ opacity: 1, y: 0 }}
+						exit={{ opacity: 0, y: -20 }}
+						transition={{ duration: 0.18, delay: Math.min(0.12, index * 0.02), ease: "easeOut" }}
+					>
+						<ResumeListItem resume={resume} />
+					</m.div>
+				))}
+			</AnimatePresence>
+		</div>
+	);
+}
+
+function ResumeListItem({ resume }: ResumeListItemProps) {
+	const { i18n } = useLingui();
+
+	const updatedAt = useMemo(() => {
+		return Intl.DateTimeFormat(i18n.locale, { dateStyle: "long", timeStyle: "short" }).format(resume.updatedAt);
+	}, [i18n.locale, resume.updatedAt]);
+
+	return (
+		<div className="flex items-center gap-x-2">
+			<Button
+				size="lg"
+				variant="ghost"
+				nativeButton={false}
+				className="h-12 w-full flex-1 justify-start gap-x-4 text-start"
+				render={
+					<Link to="/builder/$resumeId" params={{ resumeId: resume.id }}>
+						<div className="size-3" />
+						<div className="min-w-0 flex-1 truncate">{resume.name}</div>
+
+						<p className="hidden text-xs opacity-60 sm:block">
+							<Trans>Last updated on {updatedAt}</Trans>
+						</p>
+					</Link>
+				}
+			/>
+
+			<ResumeDropdownMenu resume={resume} align="end">
+				<Button size="icon" variant="ghost" className="size-12">
+					<DotsThreeIcon />
+				</Button>
+			</ResumeDropdownMenu>
+		</div>
+	);
+}

@@ -1,0 +1,3829 @@
+"""BossHunter Web Server - Bottle HTTP service + API routes.
+
+Serves:
+- /api/* → JSON data endpoints
+- /* → Frontend static files (dist/)
+"""
+
+import json
+import math
+import mimetypes
+import random
+import sqlite3
+import time
+from copy import deepcopy
+from datetime import datetime, timedelta
+from pathlib import Path
+from socketserver import ThreadingMixIn
+from threading import Event, Lock, Timer
+from uuid import uuid4
+from wsgiref.simple_server import WSGIServer
+
+import yaml
+from bottle import Bottle, HTTPResponse, request, response, static_file, abort
+
+from bosshunter import __version__
+from bosshunter.ai.credentials import get_ai_api_key
+from bosshunter.ai.scorer import sanitize_score_trace
+from bosshunter.cities import CityRefreshError, get_city_map, load_city_snapshot, refresh_city_cache
+from bosshunter.config import AI_SERVICE_PRESETS, load_config, remove_retired_collection_settings, save_config
+from bosshunter.db import (
+	JobDeletionConflictError,
+	JobManualSentConflictError,
+	add_history,
+	count_unresolved_monitor_items,
+	get_active_platform_safety_lock,
+	get_daily_activity,
+	get_db,
+	get_funnel_stats,
+	get_jobs_needing_resume,
+	get_jobs_pending_confirmation,
+	get_jobs_ready_to_send,
+	get_jobs_with_send_errors,
+	get_recent_history,
+	get_recent_monitor_replies,
+	get_score_trace,
+	get_unresolved_reply_pending,
+	get_unresolved_resume_failures,
+	get_stats,
+	get_top_companies,
+	mark_external_jobs_sent,
+	permanent_delete_jobs,
+	query_jobs,
+	restore_jobs,
+	soft_delete_jobs,
+	update_job_greeting,
+	update_job_status,
+)
+from bosshunter.collection.capabilities import platform_supports
+from bosshunter.collection.orchestrator import CollectionOrchestrator, normalize_collection_options
+from bosshunter.collection.platforms.zhilian import load_zhilian_city_snapshot
+from bosshunter.collection.platforms.job51 import load_51job_city_snapshot
+from bosshunter.collection_run_store import (
+	boss_resume_options,
+	get_collection_run,
+	list_collection_runs,
+	mark_orphaned_collection_runs_stopped,
+)
+from bosshunter.job_filters import parse_daily_salary_yuan, parse_monthly_salary_k
+from bosshunter.job_export import InvalidJobSelectionError, export_jobs, export_row_count
+from bosshunter.scoring_run_store import (
+	create_scoring_run,
+	get_scoring_run,
+	list_scoring_runs,
+	mark_orphaned_scoring_runs_paused,
+	update_scoring_run,
+)
+from bosshunter.scoring_selection import preview_scoring, select_scoring_jobs, validate_options
+from bosshunter.throttle import SendWindowChecker
+from bosshunter.web.preflight import check_ai_connection, collect_preflight_checks, error_messages
+from bosshunter.web import resume_center
+from bosshunter.web.resume_center_export import (
+	export_resume_version_pdf,
+	resume_version_markdown,
+	resume_version_markdown_filename,
+)
+from bosshunter.web.resume_center_import import apply_resume_import_draft, build_resume_import_preview
+from bosshunter.web.resume_jd_customizer import create_resume_version_for_job
+from bosshunter.web.resume_template_import import (
+	build_template_import_preview,
+	create_template_from_import_draft,
+)
+from bosshunter.web.resume_info import (
+	build_resume_info_payload,
+	is_default_resume_placeholder,
+	load_resume_info,
+	resolve_resume_filesystem_path,
+)
+from bosshunter.web.resume_names import resolve_active_resume_path, select_resume_markdown_filename
+from bosshunter.web.resume_original import (
+	remove_companion_pdf,
+	resolve_configured_resume_files,
+	upload_keeps_original_pdf,
+	write_resume_artifacts,
+)
+from bosshunter.web.resume_photo_extract import ExtractedResumePhoto, extract_resume_photo
+from bosshunter.web.resume_upload import ResumeUploadError, prepare_resume_content
+from bosshunter.web.city_lookup import CityLookupError, lookup_city
+from bosshunter.web.tasks import (
+	TaskAlreadyRunningError,
+	WorkbenchTask,
+	WorkbenchTaskRunner,
+	wait_for_initial_monitor_cooldown,
+)
+
+mimetypes.add_type("application/javascript", ".js", strict=True)
+mimetypes.add_type("application/javascript", ".mjs", strict=True)
+mimetypes.add_type("text/javascript", ".cjs", strict=True)
+mimetypes.add_type("text/css", ".css", strict=True)
+
+app = Bottle()
+task_runner = WorkbenchTaskRunner()
+job_mutation_lock = Lock()
+scheduled_delivery_lock = Lock()
+scheduled_delivery_timers: dict[str, Timer] = {}
+RESUME_PHOTO_TYPES = {
+	"image/jpeg": ".jpg",
+	"image/png": ".png",
+	"image/webp": ".webp",
+}
+RESUME_PHOTO_MAX_BYTES = 5 * 1024 * 1024
+RESUME_IMPORT_PHOTO_PREFIX = "resume_import_candidate_"
+
+
+class ThreadingWSGIServer(ThreadingMixIn, WSGIServer):
+	"""Handle Chrome preconnect sockets without blocking other requests."""
+
+	daemon_threads = True
+	allow_reuse_address = True
+
+# Paths
+FRONTEND_DIR = Path(__file__).parent / "frontend" / "dist"
+SCHEMA_PATH = Path(__file__).parent / "config_schema.json"
+
+
+def _default_base_dir() -> Path:
+	"""Resolve the runtime project directory even when launched outside repo root."""
+	source_root = Path(__file__).resolve().parents[3]
+	if (source_root / "config.yaml").exists():
+		return source_root
+
+	cwd = Path.cwd()
+	if (cwd / "config.yaml").exists():
+		return cwd
+
+	return cwd
+
+
+BASE_DIR = _default_base_dir()
+DATA_DIR = BASE_DIR / "data"
+RESUME_DIR = DATA_DIR / "resumes"
+CONFIG_PATH = BASE_DIR / "config.yaml"
+
+
+def set_base_dir(base_dir: Path | str) -> None:
+	"""Set the runtime directory used for config.yaml, data, and uploads."""
+	global BASE_DIR, DATA_DIR, RESUME_DIR, CONFIG_PATH
+	BASE_DIR = Path(base_dir).resolve()
+	DATA_DIR = BASE_DIR / "data"
+	RESUME_DIR = DATA_DIR / "resumes"
+	CONFIG_PATH = BASE_DIR / "config.yaml"
+	mark_orphaned_scoring_runs_paused(DATA_DIR / "bosshunter.db")
+	mark_orphaned_collection_runs_stopped(DATA_DIR / "bosshunter.db")
+
+
+def _get_web_db():
+	"""Open the dashboard database from the resolved runtime data directory."""
+	return get_db(DATA_DIR / "bosshunter.db")
+
+
+def _json_response(data, status_code=200):
+	"""Return JSON response with proper headers."""
+	response.content_type = "application/json; charset=utf-8"
+	response.status = status_code
+	return json.dumps(data, ensure_ascii=False, default=str)
+
+
+def _scheduled_delivery_path() -> Path:
+	return DATA_DIR / "scheduled_delivery.json"
+
+
+def _load_scheduled_deliveries() -> list[dict]:
+	path = _scheduled_delivery_path()
+	if not path.exists():
+		return []
+	try:
+		data = json.loads(path.read_text(encoding="utf-8"))
+	except (OSError, json.JSONDecodeError):
+		return []
+	if isinstance(data, dict) and isinstance(data.get("schedules"), list):
+		return [item for item in data["schedules"] if isinstance(item, dict)]
+	if isinstance(data, dict):
+		return [data]
+	if isinstance(data, list):
+		return [item for item in data if isinstance(item, dict)]
+	return []
+
+
+def _save_scheduled_deliveries(schedules: list[dict]) -> None:
+	path = _scheduled_delivery_path()
+	active_payload = {"schedules": schedules}
+	if not schedules:
+		try:
+			path.unlink()
+		except FileNotFoundError:
+			pass
+		return
+	path.parent.mkdir(parents=True, exist_ok=True)
+	path.write_text(json.dumps(active_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _parse_scheduled_at(value: str) -> datetime:
+	raw = str(value or "").strip()
+	if not raw:
+		raise ValueError("请选择定时投递时间")
+	try:
+		return datetime.fromisoformat(raw)
+	except ValueError as exc:
+		raise ValueError("定时投递时间格式无效") from exc
+
+
+def _time_in_send_windows(target: datetime, windows: list[str]) -> bool:
+	if not windows:
+		return True
+	target_minutes = target.hour * 60 + target.minute
+	valid_windows = 0
+	for window in windows:
+		parts = str(window or "").strip().split("-")
+		if len(parts) != 2:
+			continue
+		start = SendWindowChecker._parse_time(parts[0])
+		end = SendWindowChecker._parse_time(parts[1])
+		if start[0] < 0 or end[0] < 0:
+			continue
+		valid_windows += 1
+		start_minutes = start[0] * 60 + start[1]
+		end_minutes = end[0] * 60 + end[1]
+		if start_minutes <= target_minutes < end_minutes:
+			return True
+	return valid_windows == 0
+
+
+def _cancel_scheduled_delivery_timer(schedule_id: str | None = None) -> None:
+	if schedule_id is None:
+		for timer in scheduled_delivery_timers.values():
+			timer.cancel()
+		scheduled_delivery_timers.clear()
+		return
+	timer = scheduled_delivery_timers.pop(schedule_id, None)
+	if timer is not None:
+		timer.cancel()
+
+
+def _scheduled_delivery_snapshots() -> list[dict]:
+	with scheduled_delivery_lock:
+		payload = _load_scheduled_deliveries()
+	return sorted(payload, key=lambda item: str(item.get("scheduled_at") or ""))
+
+
+def _scheduled_delivery_snapshot() -> dict | None:
+	schedules = _scheduled_delivery_snapshots()
+	active = [item for item in schedules if item.get("status") == "active"]
+	return active[0] if active else (schedules[0] if schedules else None)
+
+
+def _mark_scheduled_delivery(payload: dict, **updates) -> dict:
+	updated = {
+		**payload,
+		**updates,
+		"updated_at": datetime.now().isoformat(timespec="seconds"),
+	}
+	schedules = _load_scheduled_deliveries()
+	replaced = False
+	for index, item in enumerate(schedules):
+		if item.get("id") == updated.get("id"):
+			schedules[index] = updated
+			replaced = True
+			break
+	if not replaced:
+		schedules.append(updated)
+	_save_scheduled_deliveries(schedules)
+	return updated
+
+
+def _run_scheduled_delivery(schedule_id: str) -> None:
+	with scheduled_delivery_lock:
+		schedules = _load_scheduled_deliveries()
+		payload = next((item for item in schedules if item.get("id") == schedule_id), None)
+		if not payload or payload.get("status") != "active":
+			return
+		job_ids = [str(job_id) for job_id in payload.get("job_ids", []) if str(job_id)]
+		payload = _mark_scheduled_delivery(payload, status="running", message="定时投递已启动")
+		_cancel_scheduled_delivery_timer(schedule_id)
+	if not job_ids:
+		with scheduled_delivery_lock:
+			_mark_scheduled_delivery(payload, status="failed", message="没有可投递岗位")
+		return
+
+	def mark_scheduled_started() -> None:
+		db = _get_web_db()
+		try:
+			for job_id in job_ids:
+				update_job_status(db, job_id, "approved")
+				add_history(db, job_id, "scheduled_delivery_started", "Web Dashboard 定时投递启动")
+		finally:
+			db.close()
+
+	try:
+		task = task_runner.start(
+			"deliver",
+			_task_config({"_workbench_job_ids": job_ids, "_workbench_skip_greeting": True}),
+			before_start=mark_scheduled_started,
+		)
+	except TaskAlreadyRunningError as exc:
+		with scheduled_delivery_lock:
+			_mark_scheduled_delivery(payload, status="failed", message=str(exc))
+		return
+	except Exception as exc:
+		with scheduled_delivery_lock:
+			_mark_scheduled_delivery(payload, status="failed", message=str(exc))
+		return
+	with scheduled_delivery_lock:
+		_mark_scheduled_delivery(payload, status="dispatched", task_id=task.get("id"), message="定时投递任务已提交")
+
+
+def _arm_scheduled_delivery_timer(payload: dict | None = None) -> None:
+	with scheduled_delivery_lock:
+		items = [payload] if payload else _load_scheduled_deliveries()
+		active_items = [item for item in items if item and item.get("status") == "active"]
+		if payload:
+			_cancel_scheduled_delivery_timer(str(payload.get("id")))
+		elif not active_items:
+			_cancel_scheduled_delivery_timer()
+			return
+		for current in active_items:
+			schedule_id = str(current.get("id") or "")
+			if not schedule_id:
+				continue
+			_cancel_scheduled_delivery_timer(schedule_id)
+			try:
+				scheduled_at = _parse_scheduled_at(str(current.get("scheduled_at") or ""))
+			except ValueError:
+				_mark_scheduled_delivery(current, status="failed", message="定时投递时间格式无效")
+				continue
+			delay = max((scheduled_at - datetime.now()).total_seconds(), 0)
+			timer = Timer(delay, _run_scheduled_delivery, args=(schedule_id,))
+			timer.daemon = True
+			scheduled_delivery_timers[schedule_id] = timer
+			timer.start()
+
+
+def _ensure_scheduled_delivery_timer() -> None:
+	with scheduled_delivery_lock:
+		active_items = [item for item in _load_scheduled_deliveries() if item.get("status") == "active"]
+		missing_items = [
+			item for item in active_items
+			if not (scheduled_delivery_timers.get(str(item.get("id"))) and scheduled_delivery_timers[str(item.get("id"))].is_alive())
+		]
+	for item in missing_items:
+		_arm_scheduled_delivery_timer(item)
+
+
+def _serialize_history_items(items):
+	"""Expose structured history details while retaining the legacy detail field."""
+	serialized = []
+	for item in items:
+		record = dict(item)
+		detail = record.get("detail")
+		if isinstance(detail, str) and detail.lstrip().startswith("{"):
+			try:
+				payload = json.loads(detail)
+			except (json.JSONDecodeError, TypeError):
+				payload = None
+			if isinstance(payload, dict):
+				record["detail_payload"] = payload
+		record["resolved"] = bool(record.get("resolved"))
+		serialized.append(record)
+	return serialized
+
+
+def _mask_api_key(key):
+	"""Return a display-safe API key marker."""
+	if not key:
+		return ""
+	if len(key) > 8:
+		return key[:4] + "***" + key[-4:]
+	return "***"
+
+
+def _redact_config_for_response(config):
+	"""Hide secrets before returning config to the browser."""
+	redacted = deepcopy(config)
+	ai_cfg = redacted.get("ai")
+	if isinstance(ai_cfg, dict):
+		key = ai_cfg.pop("api_key", None)
+		if key:
+			ai_cfg["api_key_masked"] = _mask_api_key(str(key))
+		auth_token = ai_cfg.pop("auth_token", None)
+		if auth_token:
+			ai_cfg["auth_token_masked"] = _mask_api_key(str(auth_token))
+	return redacted
+
+
+def _config_download_payload(config: dict) -> str:
+	"""Serialize a shareable config backup without credentials."""
+	redacted = _redact_config_for_response(config)
+	ai_cfg = redacted.get("ai")
+	if isinstance(ai_cfg, dict):
+		ai_cfg.pop("api_key_masked", None)
+		ai_cfg.pop("auth_token_masked", None)
+	return yaml.dump(redacted, allow_unicode=True, default_flow_style=False, sort_keys=False)
+
+
+def _write_config(config: dict) -> None:
+	"""Persist public settings separately from local AI credentials."""
+	save_config(config, CONFIG_PATH)
+
+
+def _sanitize_config_for_write(data):
+	"""Remove browser-only fields and preserve existing secrets on blank posts."""
+	cleaned = remove_retired_collection_settings(deepcopy(data))
+	ai_cfg = cleaned.get("ai")
+	if not isinstance(ai_cfg, dict):
+		return cleaned
+
+	ai_cfg.pop("api_key_masked", None)
+	ai_cfg.pop("has_api_key", None)
+	ai_cfg.pop("auth_token_masked", None)
+	ai_cfg.pop("has_auth_token", None)
+
+	existing_ai = load_config(CONFIG_PATH).get("ai", {})
+	service = ai_cfg.get("service") or existing_ai.get("service")
+	if service not in AI_SERVICE_PRESETS:
+		provider = ai_cfg.get("provider") or existing_ai.get("provider") or "anthropic"
+		service = "custom" if provider == "openai_compatible" else "anthropic"
+	ai_cfg["service"] = service
+	ai_cfg["provider"] = AI_SERVICE_PRESETS[service]["provider"]
+
+	clear_credentials = bool(ai_cfg.pop("clear_credentials", False))
+
+	for field in ("api_key", "auth_token"):
+		if clear_credentials:
+			posted_value = ai_cfg.get(field)
+			if posted_value is None or str(posted_value).strip() == "":
+				ai_cfg.pop(field, None)
+			continue
+		posted_value = ai_cfg.get(field)
+		existing_value = existing_ai.get(field)
+		existing_mask = _mask_api_key(str(existing_value)) if existing_value else ""
+		should_preserve = (
+			posted_value is None
+			or str(posted_value).strip() == ""
+			or (existing_mask and posted_value == existing_mask)
+		)
+
+		if should_preserve:
+			if existing_value:
+				ai_cfg[field] = existing_value
+			else:
+				ai_cfg.pop(field, None)
+
+	return cleaned
+
+
+def _preflight_messages(mode: str, config: dict, options: dict | None = None) -> list[str]:
+	"""Return user-actionable blockers before starting a dashboard task."""
+	messages: list[str] = []
+	if mode not in {"full", "collect", "rescore", "monitor"}:
+		messages.append(f"不支持的任务模式：{mode}")
+	if mode == "collect":
+		try:
+			collection_options = normalize_collection_options(config, options)
+		except ValueError as exc:
+			messages.append(str(exc))
+			return messages
+		if collection_options.get("auto_score"):
+			resume_path = config.get("profile", {}).get("resume_path", "")
+			if not resume_path or not Path(str(resume_path)).exists():
+				messages.append("自动评分前请先在配置页上传 .md、.docx 或 .pdf 简历。")
+			if not get_ai_api_key(config):
+				messages.append("选择自动评分后，请先配置当前 AI 服务的 API Key。")
+			return messages
+
+	profile = config.get("profile", {})
+	resume_path = profile.get("resume_path", "")
+	if mode in {"full", "rescore"} and (not resume_path or not Path(str(resume_path)).exists()):
+		messages.append("请先在配置页上传 .md、.docx 或 .pdf 简历。")
+
+	if mode == "full":
+		try:
+			full_options = normalize_collection_options(config, options)
+		except ValueError as exc:
+			messages.append(str(exc))
+		else:
+			if not full_options.get("platform_order"):
+				messages.append("运行全流程至少需要选择一个采集平台。")
+
+	if mode in {"full", "rescore"} and not get_ai_api_key(config):
+		messages.append("请先在配置页填写当前 AI 服务的 API Key，或设置对应的标准环境变量。")
+
+	return messages
+
+
+def _task_config(extra: dict | None = None) -> dict:
+	config = load_config(CONFIG_PATH)
+	if extra:
+		config.update(extra)
+	return config
+
+
+def _log(task: WorkbenchTask, message: str) -> None:
+	task.logs.append(message)
+
+
+def _record_collect_progress(task: WorkbenchTask, state: dict) -> None:
+	task.metrics.update({
+		"collect_seen": int(state.get("seen") or 0),
+		"collect_new": int(state.get("new") or 0),
+		"collect_duplicate": int(state.get("duplicate") or 0),
+		"collect_filtered": int(state.get("filtered") or 0),
+		"collect_parse_failed": int(state.get("parse_failed") or 0),
+		"collect_save_failed": int(state.get("save_failed") or 0),
+		"collect_search_pages": int(state.get("search_pages") or 0),
+	})
+	if isinstance(state.get("progress"), dict):
+		task.progress = deepcopy(state["progress"])
+
+
+def _record_score_progress(task: WorkbenchTask, state: dict) -> None:
+	task.metrics.update({
+		"ai_completed": int(state.get("completed") or 0),
+		"ai_total": int(state.get("total") or 0),
+		"ai_passed": int(state.get("scored") or 0),
+		"ai_filtered": int(state.get("filtered") or 0),
+		"ai_failed": int(state.get("failed") or 0),
+	})
+	_log(
+		task,
+		f"AI 评分进度 {state['completed']}/{state['total']}：通过 {state['scored']}，过滤 {state['filtered']}，失败 {state['failed']}",
+	)
+
+
+def _execute_collect(task: WorkbenchTask, config: dict) -> None:
+	_log(task, "开始采集岗位")
+	collect_config = dict(config)
+	collect_config["_workbench_stop_event"] = task.stop_requested
+	collect_config["_workbench_collect_progress"] = lambda state: _record_collect_progress(task, state)
+	collect_config["_workbench_log"] = lambda message: _log(task, message)
+	collect_config["_workbench_score_progress"] = lambda state: _record_score_progress(task, state)
+	if "_collection_options" not in config:
+		# Preserve the old private executor seam used by legacy callers. New Web
+		# collection tasks always inject normalized options before starting.
+		from bosshunter.ai.scorer import score_jobs
+		from bosshunter.scraper.jobs import scrape_jobs
+		keywords = config.get("search", {}).get("keywords", [])
+		collected_job_ids: list[str] = []
+		scrape_jobs(collect_config, keywords, collected_job_ids=collected_job_ids)
+		collect_report = collect_config.get("_workbench_collect_report", {})
+		_stop_or_log_boss_collection_reason(task, str(collect_report.get("stop_reason") or ""))
+		if task.stop_requested.is_set():
+			return
+		task.context["boss_collection_completed_monotonic"] = time.monotonic()
+		_log(task, f"本轮采集完成：扫描 {task.metrics.get('collect_seen', 0)}，新增 {task.metrics.get('collect_new', 0)}，重复 {task.metrics.get('collect_duplicate', 0)}")
+		_log(task, f"开始 AI 评分：处理全部未评分岗位（本轮新增 {len(collected_job_ids)} 个）")
+		score_config = dict(config)
+		score_config["_workbench_stop_event"] = task.stop_requested
+		score_config["_workbench_log"] = lambda message: _log(task, message)
+		score_config["_workbench_score_progress"] = lambda state: _record_score_progress(task, state)
+		score_jobs(score_config)
+		return
+
+	result = CollectionOrchestrator(
+		collect_config,
+		db_path=DATA_DIR / "bosshunter.db",
+		task_id=task.id,
+	).run(config.get("_collection_options"))
+	task.progress = {
+		"run_id": result.get("run_id", ""),
+		"outcome": result.get("status", "completed"),
+		"platforms": result.get("platforms", {}),
+		"collected_job_ids": result.get("collected_job_ids", []),
+	}
+	boss_state = result.get("platforms", {}).get("boss", {})
+	if isinstance(boss_state, dict):
+		_stop_or_log_boss_collection_reason(task, str(boss_state.get("reason_code") or ""))
+		if boss_state.get("status") not in {None, "queued"}:
+			task.context["boss_collection_completed_monotonic"] = time.monotonic()
+	_log(task, f"本轮采集完成：新增 {len(result.get('collected_job_ids', []))}，状态 {result.get('status', 'completed')}")
+	if task.stop_requested.is_set():
+		return
+
+
+def _stop_or_log_boss_collection_reason(task: WorkbenchTask, stop_reason: str) -> None:
+	limit_labels = {
+		"daily_search_page_limit": "BOSS 单日搜索页上限",
+		"daily_detail_page_limit": "BOSS 单日详情页上限",
+		"daily_platform_page_limit": "BOSS 单日页面访问总上限",
+		"persistent_risk_lock": "BOSS 风险冷却锁",
+	}
+	risk_labels = {
+		"captcha": "BOSS 验证码",
+		"blocked": "BOSS 账号或请求拦截",
+		"rate_limit": "BOSS 频率限制",
+		"login_required": "BOSS 登录状态失效",
+		"consecutive_page_failures": "BOSS 连续页面失败",
+	}
+	if stop_reason in limit_labels:
+		_log(task, f"为了账户安全，已达到{limit_labels[stop_reason]}，仅停止 BOSS 访问；智联和 51job 不占用该额度")
+	elif stop_reason in risk_labels:
+		reason = f"为了账户安全，检测到{risk_labels[stop_reason]}，已立即停止并进入安全冷却"
+		task.stop_reason = reason
+		task.stop_requested.set()
+		_log(task, reason)
+
+
+def _execute_rescore(task: WorkbenchTask, config: dict) -> None:
+	from bosshunter.ai.scorer import score_jobs
+
+	score_config = dict(config)
+	score_config["_workbench_stop_event"] = task.stop_requested
+	score_config["_workbench_log"] = lambda message: _log(task, message)
+	score_config["_workbench_score_progress"] = lambda state: _record_score_progress(task, state)
+	_log(task, "开始重新评分")
+	score_jobs(score_config, rescore_filtered=True)
+
+
+def _execute_score(task: WorkbenchTask, config: dict) -> None:
+	from bosshunter.ai.scorer import score_jobs
+
+	run_id = str(config.get("_score_run_id") or "")
+	options = config.get("_score_options", {}) if isinstance(config.get("_score_options"), dict) else {}
+	db_path = DATA_DIR / "bosshunter.db"
+
+	def checkpoint(state: dict) -> None:
+		remaining = [str(job_id) for job_id in state.get("remaining_job_ids", []) if str(job_id)]
+		status = str(state.get("status") or "running")
+		pause_reason = str(state.get("pause_reason") or "") if status == "paused" else None
+		# AI 失败暂停时同步写入 error 列与 task.error，前端任务列表才能看到真实原因（issue #100）。
+		error = str(state.get("error") or "") if status == "paused" else None
+		update_scoring_run(
+			db_path,
+			run_id,
+			status=status,
+			remaining_job_ids=remaining,
+			progress={**task.metrics, "remaining": len(remaining)},
+			pause_reason=pause_reason,
+			error=error or None,
+		)
+		if status == "paused":
+			task.stop_reason = str(state.get("pause_reason") or "评分任务已暂停")
+			if error:
+				task.error = error
+			task.stop_requested.set()
+
+	score_config = dict(config)
+	score_config["_workbench_stop_event"] = task.stop_requested
+	score_config["_workbench_log"] = lambda message: _log(task, message)
+	score_config["_workbench_score_progress"] = lambda state: _record_score_progress(task, state)
+	score_config["_workbench_score_checkpoint"] = checkpoint
+	_log(task, f"开始单独 AI 评分：{len(options.get('job_ids', []))} 个岗位")
+	try:
+		score_jobs(
+			score_config,
+			scope="selected",
+			limit=None,
+			job_ids=list(options.get("job_ids", [])),
+			force_rescore=bool(options.get("force_rescore")),
+		)
+	except Exception as exc:
+		update_scoring_run(db_path, run_id, status="failed", error=str(exc)[:1000])
+		raise
+
+
+def _queue_monitor_delivery(
+	task: WorkbenchTask,
+	job_ids: list[str],
+	*,
+	direct_send: bool = False,
+) -> dict:
+	"""Queue confirmed jobs on a task that is already in its monitor loop."""
+	queue_lock = task.context.get("monitor_queue_lock")
+	if queue_lock is None:
+		queue_lock = Lock()
+		task.context["monitor_queue_lock"] = queue_lock
+	with queue_lock:
+		pending = task.context.setdefault("pending_deliveries", [])
+		queued_ids = {
+			str(job_id)
+			for batch in pending
+			for job_id in batch.get("job_ids", [])
+		}
+		new_ids = [job_id for job_id in job_ids if job_id not in queued_ids]
+		if new_ids:
+			pending.append({"job_ids": new_ids, "direct_send": direct_send})
+			_log(task, f"监测期间新增 {len(new_ids)} 个确认投递岗位，已加入发送队列")
+	wakeup_event = task.context.get("monitor_wakeup_event")
+	if isinstance(wakeup_event, Event):
+		wakeup_event.set()
+	return task.snapshot()
+
+
+def _take_monitor_deliveries(task: WorkbenchTask) -> list[dict]:
+	queue_lock = task.context.get("monitor_queue_lock")
+	if queue_lock is None:
+		return []
+	with queue_lock:
+		pending = list(task.context.get("pending_deliveries", []))
+		task.context["pending_deliveries"] = []
+	return pending
+
+
+def _execute_monitor(task: WorkbenchTask, config: dict, *, initial_cooldown: bool = False) -> None:
+	from bosshunter.executor.monitor import (
+		get_effective_monitor_interval_minutes,
+		monitor_and_send_resumes,
+	)
+	if _stop_for_active_platform_lock(task):
+		return
+
+	monitor_config = dict(config)
+	monitor_config["_workbench_stop_event"] = task.stop_requested
+	monitor_config["_monitor_reuse_chat_tab"] = True
+	monitor_config["_monitor_runtime_state"] = {}
+	interval_min = get_effective_monitor_interval_minutes(config)
+	interval_sec = max(interval_min * 60, 1)
+	queue_lock = task.context.setdefault("monitor_queue_lock", Lock())
+	wakeup_event = task.context.setdefault("monitor_wakeup_event", Event())
+	task.context["monitoring"] = True
+	try:
+		if initial_cooldown and wait_for_initial_monitor_cooldown(task, config, _log):
+			return
+		while not task.stop_requested.is_set():
+			for batch in _take_monitor_deliveries(task):
+				deliver_config = dict(config)
+				deliver_config["_workbench_job_ids"] = batch.get("job_ids", [])
+				if batch.get("direct_send"):
+					deliver_config["_workbench_skip_greeting"] = True
+				_log(task, f"处理监测期间新增的 {len(deliver_config['_workbench_job_ids'])} 个投递岗位")
+				_execute_deliver(task, deliver_config)
+				if task.stop_requested.is_set():
+					return
+			_log(task, "执行一轮监测")
+			summary = monitor_and_send_resumes(monitor_config)
+			if task.stop_requested.is_set():
+				return
+			stop_reason = summary.get("stop_reason")
+			if stop_reason:
+				reason_labels = {
+					"captcha": "验证码",
+					"rate_limit": "频率限制",
+					"blocked": "账号或请求被拦截",
+					"consecutive_page_failures": "连续页面失败",
+					"daily_platform_page_limit": "单日平台页面访问上限",
+					"persistent_risk_lock": "平台安全锁冷却",
+				}
+				reason = f"监测已安全停止：检测到{reason_labels.get(stop_reason, '风险信号')}"
+				task.stop_reason = reason
+				task.stop_requested.set()
+				_log(task, reason)
+				return
+			_log(task, f"本轮监测完成，{interval_min:g} 分钟后再次检查")
+			wakeup_event.wait(interval_sec)
+			wakeup_event.clear()
+	finally:
+		from bosshunter.executor.monitor import close_monitor_chat_target
+		close_monitor_chat_target(monitor_config)
+		task.context["monitoring"] = False
+		task.context.pop("monitor_wakeup_event", None)
+		task.context.pop("monitor_queue_lock", None)
+
+
+def _execute_full(task: WorkbenchTask, config: dict) -> None:
+	db = _get_web_db()
+	try:
+		deferred_job_ids = [str(job["id"]) for job in get_jobs_ready_to_send(db)]
+	finally:
+		db.close()
+	if deferred_job_ids:
+		_log(task, f"优先续发上次已确认但未完成的 {len(deferred_job_ids)} 个岗位")
+		deferred_config = load_config(CONFIG_PATH)
+		deferred_config["_workbench_job_ids"] = deferred_job_ids
+		deferred_config["_workbench_skip_greeting"] = True
+		_execute_deliver(task, deferred_config)
+		if task.stop_requested.is_set():
+			return
+
+	full_collection_config = dict(config)
+	try:
+		configured_options = full_collection_config.get("_collection_options")
+		if not isinstance(configured_options, dict):
+			configured_options = normalize_collection_options(full_collection_config, None)
+		full_collection_config["_collection_options"] = {
+			**configured_options,
+			"auto_score": True,
+		}
+	except ValueError as exc:
+		if "不支持已启用的智联招聘" in str(exc):
+			raise
+		# Keep the legacy executor path available for callers/tests that supply
+		# an intentionally minimal config and replace collection externally.
+		full_collection_config.pop("_collection_options", None)
+	_execute_collect(task, full_collection_config)
+	if task.stop_requested.is_set():
+		return
+
+	db = _get_web_db()
+	try:
+		threshold = int(config.get("scoring", {}).get("threshold", 60) or 60)
+		pending_confirmation = [
+			job for job in get_jobs_pending_confirmation(db)
+			if int(job.get("score") or 0) >= threshold
+		]
+	finally:
+		db.close()
+	if not pending_confirmation:
+		task.context["waiting_confirmation"] = False
+		task.context["confirmation_complete"] = True
+		_log(task, "没有待确认岗位，流程结束")
+		return
+
+	confirmation_event = Event()
+	task.context["confirmation_event"] = confirmation_event
+	task.context["waiting_confirmation"] = True
+	if task.context.get("delivery_requested"):
+		confirmation_event.set()
+	_log(task, "等待前端确认投递")
+	while not task.stop_requested.is_set() and not confirmation_event.wait(0.5):
+		pass
+	if task.stop_requested.is_set():
+		return
+
+	job_ids = [str(job_id) for job_id in task.context.get("confirmed_job_ids", []) if str(job_id)]
+	task.context["waiting_confirmation"] = False
+	task.context["confirmation_complete"] = True
+	task.context["delivery_requested"] = False
+	if not job_ids:
+		_log(task, "未收到前端确认岗位，流程结束")
+		return
+
+	_log(task, f"前端已确认 {len(job_ids)} 个岗位，继续投递")
+	if _wait_for_collection_delivery_cooldown(task, config):
+		return
+	# The user may adjust the daily limit or other send settings while reviewing
+	# jobs. Reload immediately before delivery instead of using the task-start snapshot.
+	deliver_config = load_config(CONFIG_PATH)
+	deliver_config["_workbench_job_ids"] = job_ids
+	_execute_deliver(task, deliver_config)
+	if task.stop_requested.is_set():
+		return
+	_execute_monitor(task, load_config(CONFIG_PATH), initial_cooldown=True)
+
+
+def _queue_active_delivery(
+	task: WorkbenchTask,
+	job_ids: list[str],
+	*,
+	direct_send: bool,
+) -> tuple[dict, list[str]]:
+	"""Append jobs to the currently running single delivery worker."""
+	queue_lock = task.context.setdefault("delivery_queue_lock", Lock())
+	with queue_lock:
+		if not task.context.get("delivering"):
+			raise TaskAlreadyRunningError("当前发送任务即将结束，请稍后重试")
+		scheduled_ids = task.context.setdefault("delivery_scheduled_ids", set())
+		new_ids = [job_id for job_id in job_ids if job_id not in scheduled_ids]
+		already_queued_count = len(job_ids) - len(new_ids)
+		if new_ids:
+			task.context.setdefault("pending_deliveries", []).append({
+				"job_ids": new_ids,
+				"direct_send": direct_send,
+			})
+			scheduled_ids.update(new_ids)
+			_log(task, f"新增 {len(new_ids)} 个岗位，已加入当前发送队列")
+		elif already_queued_count:
+			_log(task, f"所选 {already_queued_count} 个岗位已在当前发送队列中")
+	payload = task.snapshot()
+	payload["queued_count"] = len(new_ids)
+	payload["already_queued_count"] = already_queued_count
+	return payload, new_ids
+
+
+def _take_active_delivery(task: WorkbenchTask) -> dict | None:
+	queue_lock = task.context.get("delivery_queue_lock")
+	if queue_lock is None:
+		return None
+	with queue_lock:
+		pending = task.context.setdefault("pending_deliveries", [])
+		if pending:
+			return pending.pop(0)
+		task.context["delivering"] = False
+		return None
+
+
+def _execute_deliver(task: WorkbenchTask, config: dict) -> None:
+	"""Run one delivery worker and drain batches queued while it is active."""
+	if _stop_for_active_platform_lock(task):
+		return
+	queue_lock = task.context.setdefault("delivery_queue_lock", Lock())
+	with queue_lock:
+		task.context["delivering"] = True
+		task.context.setdefault("pending_deliveries", [])
+		task.context.setdefault("delivery_scheduled_ids", set()).update(
+			str(job_id) for job_id in config.get("_workbench_job_ids", []) if str(job_id)
+		)
+
+	current_config = config
+	try:
+		while not task.stop_requested.is_set():
+			_execute_deliver_batch(task, current_config)
+			if task.stop_requested.is_set():
+				return
+			batch = _take_active_delivery(task)
+			if not batch:
+				return
+			current_config = dict(config)
+			current_config["_workbench_job_ids"] = batch.get("job_ids", [])
+			if batch.get("direct_send"):
+				current_config["_workbench_skip_greeting"] = True
+			else:
+				current_config.pop("_workbench_skip_greeting", None)
+			_log(task, f"继续处理队列中的 {len(current_config['_workbench_job_ids'])} 个岗位")
+	finally:
+		with queue_lock:
+			task.context["delivering"] = False
+			task.context.pop("delivery_scheduled_ids", None)
+			task.context.pop("pending_deliveries", None)
+
+
+def _execute_prepare(task: WorkbenchTask, config: dict) -> None:
+	"""Confirm selected jobs and generate greetings without sending them."""
+	from bosshunter.ai.greeter import generate_greetings
+
+	config = dict(config)
+	config["_workbench_stop_event"] = task.stop_requested
+	config["_workbench_log"] = lambda message: _log(task, message)
+	selected_job_ids = [str(job_id) for job_id in config.get("_workbench_job_ids", []) if str(job_id)]
+	_log(task, "生成预投递招呼语")
+	generated_count = generate_greetings(config)
+	report = config.get("_workbench_greeting_report", {})
+	skipped_existing = int(report.get("skipped_existing", 0) or 0)
+	failed_count = int(report.get("failed_count", 0) or 0)
+	requested_count = int(report.get("requested_count", len(selected_job_ids)) or 0)
+	ready_count = generated_count + skipped_existing
+	task.metrics.update({
+		"prepare_requested": requested_count,
+		"greeting_generated": generated_count,
+		"greeting_existing": skipped_existing,
+		"greeting_failed": failed_count,
+	})
+	_log(
+		task,
+		f"预投递准备完成：{ready_count}/{len(selected_job_ids) or requested_count} 个岗位已具备招呼语，"
+		f"新生成 {generated_count}，保留已有 {skipped_existing}",
+	)
+	if failed_count:
+		_log(task, f"{failed_count} 个岗位未生成招呼语，仍保留在待确认列表，可稍后重试。")
+
+
+def _stop_for_active_platform_lock(task: WorkbenchTask) -> bool:
+	db = _get_web_db()
+	try:
+		lock = get_active_platform_safety_lock(db)
+	finally:
+		db.close()
+	if not lock:
+		return False
+	reason = "为了账户安全，平台风险冷却尚未结束，已停止本次平台访问"
+	task.stop_reason = reason
+	task.stop_requested.set()
+	_log(task, reason)
+	return True
+
+
+def _wait_for_collection_delivery_cooldown(task: WorkbenchTask, config: dict) -> bool:
+	completed_at = task.context.get("boss_collection_completed_monotonic")
+	if not isinstance(completed_at, (int, float)):
+		return False
+	collection_config = config.get("collection", {})
+	selected_minutes = task.context.get("boss_delivery_cooldown_minutes")
+	if not isinstance(selected_minutes, (int, float)):
+		if (
+			"delivery_cooldown_min_minutes" in collection_config
+			or "delivery_cooldown_max_minutes" in collection_config
+		):
+			try:
+				minimum = max(float(collection_config.get("delivery_cooldown_min_minutes", 5)), 0)
+			except (TypeError, ValueError):
+				minimum = 5
+			try:
+				maximum = max(float(collection_config.get("delivery_cooldown_max_minutes", 15)), 0)
+			except (TypeError, ValueError):
+				maximum = 15
+			minimum, maximum = sorted((minimum, maximum))
+			selected_minutes = random.uniform(minimum, maximum)
+		else:
+			# Compatibility with configurations saved before random cooldown ranges.
+			try:
+				selected_minutes = max(float(collection_config.get("delivery_cooldown_minutes", 10)), 0)
+			except (TypeError, ValueError):
+				selected_minutes = 10
+		task.context["boss_delivery_cooldown_minutes"] = selected_minutes
+	cooldown_seconds = float(selected_minutes) * 60
+	remaining = max(cooldown_seconds - (time.monotonic() - completed_at), 0)
+	if remaining <= 0:
+		return False
+	_log(task, f"为了账户安全，BOSS 采集结束后冷却 {remaining / 60:.1f} 分钟再开始 BOSS 投递")
+	if task.stop_requested.wait(remaining):
+		_log(task, "采集到投递的安全冷却已取消")
+		return True
+	return False
+
+
+def _execute_deliver_batch(task: WorkbenchTask, config: dict) -> None:
+	from bosshunter.ai.greeter import generate_greetings
+	from bosshunter.executor.sender import send_greetings
+
+	config = dict(config)
+	config["_workbench_stop_event"] = task.stop_requested
+	config["_workbench_log"] = lambda message: _log(task, message)
+	selected_job_ids = [str(job_id) for job_id in config.get("_workbench_job_ids", []) if str(job_id)]
+	if not config.get("_workbench_skip_greeting"):
+		_log(task, "生成招呼语")
+		generated_count = generate_greetings(config)
+		greeting_report = config.get("_workbench_greeting_report", {})
+		skipped_existing = int(greeting_report.get("skipped_existing", 0) or 0)
+		ready_count = generated_count + skipped_existing
+		_log(task, f"招呼语准备完成：{ready_count}/{len(selected_job_ids) or ready_count}（新生成 {generated_count}）")
+		if task.stop_requested.is_set():
+			return
+		if selected_job_ids and ready_count < len(selected_job_ids):
+			missing_count = len(selected_job_ids) - ready_count
+			# 生成失败的岗位保留为待生成且无招呼语文本，本就不会进入发送；其余岗位继续走
+			# 现有人工确认、发送窗口与风控规则（#101 回归：不再因部分失败放弃整个批次）。
+			_log(
+				task,
+				f"{missing_count} 个岗位未生成招呼语，已保留为待生成，请在 BOSS 中手动填写；"
+				"其余岗位继续进入发送流程。",
+			)
+	_log(task, "发送招呼语")
+	# The workbench must obey the same send window and day-off guard as the CLI.
+	# ``force`` remains an explicit CLI-only override and is never implied by a
+	# browser button click.
+	sent_count = send_greetings(config, force=False)
+	report = config.get("_workbench_send_report", {})
+	failed_count = int(report.get("failed_count", 0) or 0)
+	deferred_count = int(report.get("deferred_count", 0) or 0)
+	quota_deferred_count = min(
+		int(report.get("quota_deferred_count", 0) or 0),
+		deferred_count,
+	)
+	paused_count = max(deferred_count - quota_deferred_count, 0)
+	task.metrics.update({
+		"send_requested": int(report.get("requested_count", len(selected_job_ids)) or 0),
+		"send_success": int(report.get("sent_count", sent_count) or 0),
+		"send_failed": failed_count,
+		"send_deferred": deferred_count,
+		"send_quota_deferred": quota_deferred_count,
+		"send_already_today": int(report.get("already_sent", 0) or 0),
+		"send_daily_limit": int(report.get("daily_limit", 0) or 0),
+		"send_remaining_quota": int(report.get("remaining_quota", 0) or 0),
+	})
+	total_count = len(selected_job_ids) or sent_count + failed_count + deferred_count
+	_log(
+		task,
+		f"招呼语发送结果：成功 {sent_count}，失败 {failed_count}，待下次发送 {deferred_count}（共 {total_count}）",
+	)
+	if failed_count:
+		_log(task, f"{failed_count} 个岗位发送失败已单独记录，继续后续流程")
+	if quota_deferred_count:
+		_log(task, f"{quota_deferred_count} 个岗位因今日发送额度未执行，已保留在“预投递”")
+	if paused_count:
+		_log(task, f"{paused_count} 个岗位本轮未执行，已保留在“预投递”")
+
+	stop_reason = report.get("stop_reason")
+	if stop_reason:
+		task.stop_reason = str(stop_reason)
+	if stop_reason in {"captcha", "rate_limit", "blocked", "consecutive_errors"}:
+		reason_labels = {
+			"captcha": "验证码",
+			"rate_limit": "频率限制",
+			"blocked": "账号或请求被拦截",
+			"consecutive_errors": "连续错误过多",
+		}
+		raise RuntimeError(f"发送已安全暂停：检测到{reason_labels[stop_reason]}")
+
+
+task_runner._executors.update({
+	"full": _execute_full,
+	"collect": _execute_collect,
+	"rescore": _execute_rescore,
+	"score": _execute_score,
+	"monitor": _execute_monitor,
+	"prepare": _execute_prepare,
+	"deliver": _execute_deliver,
+})
+
+
+# ─── Health ───────────────────────────────────────────────
+
+@app.route("/api/health")
+def health():
+	return _json_response({"status": "ok", "version": __version__})
+
+
+# ─── Dashboard APIs ──────────────────────────────────────
+
+@app.route("/api/funnel")
+def api_funnel():
+	db = _get_web_db()
+	try:
+		data = get_funnel_stats(db)
+		return _json_response(data)
+	finally:
+		db.close()
+
+
+@app.route("/api/stats")
+def api_stats():
+	db = _get_web_db()
+	try:
+		data = get_stats(db)
+		return _json_response(data)
+	finally:
+		db.close()
+
+
+@app.route("/api/activity")
+def api_activity():
+	days = int(request.params.get("days", 7))
+	db = _get_web_db()
+	try:
+		data = get_daily_activity(db, days)
+		return _json_response(data)
+	finally:
+		db.close()
+
+
+@app.route("/api/jobs")
+def api_jobs():
+	try:
+		deleted = request.params.get("deleted", "active").strip()
+		limit = int(request.params.get("limit", 100))
+		offset = int(request.params.get("offset", 0))
+		if deleted not in {"active", "only", "all"} or not 1 <= limit <= 500 or offset < 0:
+			raise ValueError("岗位查询参数无效")
+	except (TypeError, ValueError) as exc:
+		return _json_response({"error": str(exc)}, 400)
+
+	db = _get_web_db()
+	try:
+		jobs, total = query_jobs(db, deleted=deleted, limit=limit, offset=offset)
+		response.headers["X-Total-Count"] = str(total)
+		return _json_response(jobs)
+	finally:
+		db.close()
+
+
+def _optional_float_param(name: str, *, minimum: float = 0, maximum: float | None = None):
+	raw_value = request.params.get(name)
+	if raw_value in (None, ""):
+		return None
+	try:
+		value = float(raw_value)
+	except (TypeError, ValueError) as exc:
+		raise ValueError(f"{name} 必须是数字") from exc
+	if not math.isfinite(value):
+		raise ValueError(f"{name} 必须是有限数字")
+	if value < minimum or (maximum is not None and value > maximum):
+		raise ValueError(f"{name} 超出允许范围")
+	return value
+
+
+def _integer_param(name: str, default: int, *, minimum: int, maximum: int | None = None):
+	raw_value = request.params.get(name, str(default))
+	try:
+		value = int(raw_value)
+	except (TypeError, ValueError) as exc:
+		raise ValueError(f"{name} 必须是整数") from exc
+	if value < minimum or (maximum is not None and value > maximum):
+		raise ValueError(f"{name} 超出允许范围")
+	return value
+
+
+def _score_trace_missing_state(job: dict) -> str:
+	"""Classify a missing trace without inferring an AI failure from incomplete evidence."""
+	reason = str(job.get("score_reason") or "").strip()
+	if reason.startswith("预筛不通过:"):
+		return "prefilter_only"
+	if reason.startswith(("AI评分失败:", "AI 评分失败:", "评分失败:")):
+		return "failed"
+	if reason or str(job.get("status") or "") in {
+		"scored",
+		"ready",
+		"approved",
+		"rejected",
+		"sent",
+		"replied",
+		"resume_sent",
+		"needs_resume",
+		"follow_up_sent",
+	}:
+		return "legacy_missing"
+	return "unavailable"
+
+
+@app.route("/api/jobs/search")
+def api_job_search():
+	try:
+		minimum_score = _optional_float_param("min_score", maximum=100)
+		salary_min = _optional_float_param("salary_min")
+		salary_max = _optional_float_param("salary_max")
+		daily_salary_min = _optional_float_param("daily_salary_min")
+		daily_salary_max = _optional_float_param("daily_salary_max")
+		limit = _integer_param("limit", 15, minimum=1, maximum=100)
+		offset = _integer_param("offset", 0, minimum=0)
+		if salary_min is not None and salary_max is not None and salary_min > salary_max:
+			raise ValueError("最低薪资不能高于最高薪资")
+		if daily_salary_min is not None and daily_salary_max is not None and daily_salary_min > daily_salary_max:
+			raise ValueError("最低日薪不能高于最高日薪")
+		created_within = request.params.get("created_within", "").strip()
+		if created_within and created_within not in {"today", "3d", "7d"}:
+			raise ValueError("created_within 参数无效")
+		recruitment_type = request.params.get("recruitment_type", "").strip()
+		if recruitment_type and recruitment_type not in {"campus", "experienced", "internship", "unknown"}:
+			raise ValueError("recruitment_type 参数无效")
+		education_filter = (request.query.getunicode("education") or "").strip()
+		if education_filter and education_filter not in {"博士", "硕士", "本科", "大专", "不限", "其他", "unknown"}:
+			raise ValueError("education 参数无效")
+		sort_by = request.params.get("sort_by", "created_at").strip()
+		if sort_by not in {"salary", "education", "score", "status", "hr_active", "created_at"}:
+			raise ValueError("sort_by 参数无效")
+		sort_order = request.params.get("sort_order", "desc").strip().lower()
+		if sort_order not in {"asc", "desc"}:
+			raise ValueError("sort_order 参数无效")
+	except ValueError as exc:
+		return _json_response({"error": str(exc)}, 400)
+
+	query = "SELECT * FROM jobs"
+	conditions = ["deleted_at IS NULL"]
+	params = []
+	keyword = (request.query.getunicode("q") or "").strip()
+	status_filter = request.params.get("status", "").strip()
+	if keyword:
+		conditions.append("(title LIKE ? OR company LIKE ? OR jd LIKE ? OR score_reason LIKE ?)")
+		keyword_param = f"%{keyword}%"
+		params.extend([keyword_param] * 4)
+	if minimum_score is not None:
+		conditions.append("score >= ?")
+		params.append(minimum_score)
+	if status_filter:
+		conditions.append("status = ?")
+		params.append(status_filter)
+	source_platform = request.params.get("source_platform", "").strip()
+	if source_platform:
+		if source_platform not in {"boss", "zhilian", "51job"}:
+			return _json_response({"error": "source_platform 参数无效"}, 400)
+		conditions.append("COALESCE(source_platform, 'boss') = ?")
+		params.append(source_platform)
+	if recruitment_type:
+		conditions.append("COALESCE(recruitment_type, 'unknown') = ?")
+		params.append(recruitment_type)
+	if education_filter:
+		if education_filter == "unknown":
+			conditions.append("COALESCE(TRIM(education), '') = ''")
+		else:
+			conditions.append("education LIKE ?")
+			params.append(f"%{education_filter}%")
+	if created_within == "today":
+		conditions.append("created_at >= datetime('now', 'localtime', 'start of day', 'utc')")
+	elif created_within == "3d":
+		conditions.append("created_at >= datetime('now', '-3 days')")
+	elif created_within == "7d":
+		conditions.append("created_at >= datetime('now', '-7 days')")
+	if conditions:
+		query += " WHERE " + " AND ".join(conditions)
+	sort_expressions = {
+		"salary": "CAST(REPLACE(substr(COALESCE(salary, ''), 1, CASE WHEN instr(salary, 'K') > 0 THEN instr(salary, 'K') - 1 ELSE length(salary) END), ',', '') AS REAL)",
+		"education": "CASE TRIM(COALESCE(education, '')) WHEN '博士' THEN 5 WHEN '硕士' THEN 4 WHEN '本科' THEN 3 WHEN '大专' THEN 2 WHEN '不限' THEN 1 ELSE 0 END",
+		"score": "COALESCE(score, 0)",
+		"status": "COALESCE(status, '')",
+		"hr_active": "COALESCE(hr_active, '')",
+		"created_at": "COALESCE(created_at, '')",
+	}
+	query += f" ORDER BY {sort_expressions[sort_by]} {sort_order.upper()}, created_at DESC, score DESC"
+
+	db = _get_web_db()
+	try:
+		all_total = db.execute("SELECT COUNT(*) FROM jobs WHERE deleted_at IS NULL").fetchone()[0]
+		rows = [dict(row) for row in db.execute(query, params).fetchall()]
+		if salary_min is not None or salary_max is not None or daily_salary_min is not None or daily_salary_max is not None:
+			filtered_rows = []
+			for row in rows:
+				if salary_min is not None or salary_max is not None:
+					salary_range = parse_monthly_salary_k(row.get("salary", ""))
+					if salary_range is None:
+						continue
+					job_min, job_max = salary_range
+					if salary_min is not None and job_max < salary_min:
+						continue
+					if salary_max is not None and job_min > salary_max:
+						continue
+				if daily_salary_min is not None or daily_salary_max is not None:
+					daily_salary_range = parse_daily_salary_yuan(row.get("salary", ""))
+					if daily_salary_range is None:
+						continue
+					job_daily_min, job_daily_max = daily_salary_range
+					if daily_salary_min is not None and job_daily_max < daily_salary_min:
+						continue
+					if daily_salary_max is not None and job_daily_min > daily_salary_max:
+						continue
+				filtered_rows.append(row)
+			rows = filtered_rows
+		total = len(rows)
+		return _json_response({
+			"items": rows[offset:offset + limit],
+			"total": total,
+			"all_total": all_total,
+			"limit": limit,
+			"offset": offset,
+		})
+	finally:
+		db.close()
+
+
+@app.route("/api/top-companies")
+def api_top_companies():
+	limit = int(request.params.get("limit", 5))
+	db = _get_web_db()
+	try:
+		data = get_top_companies(db, limit)
+		return _json_response(data)
+	finally:
+		db.close()
+
+
+@app.route("/api/history")
+def api_history():
+	limit = int(request.params.get("limit", 15))
+	include_unresolved = request.params.get("include_unresolved", "").lower() in ("1", "true", "yes")
+	include_monitor_conversations = request.params.get("include_monitor_conversations", "").lower() in ("1", "true", "yes")
+	db = _get_web_db()
+	try:
+		data = get_recent_history(db, limit)
+		if include_unresolved or include_monitor_conversations:
+			monitor_replies = get_recent_monitor_replies(db) if include_monitor_conversations else []
+			if include_monitor_conversations:
+				retained_reply_ids = {item["id"] for item in monitor_replies}
+				data = [
+					item for item in data
+					if item["action"] not in ("replied", "auto_replied", "resume_sent") or item["id"] in retained_reply_ids
+				]
+			seen_ids = {item["id"] for item in data}
+			extra_groups = []
+			if include_unresolved:
+				extra_groups.extend((
+					get_unresolved_reply_pending(db),
+					get_unresolved_resume_failures(db),
+				))
+			if include_monitor_conversations:
+				extra_groups.append(monitor_replies)
+			for extra_items in extra_groups:
+				data.extend(item for item in extra_items if item["id"] not in seen_ids)
+				seen_ids.update(item["id"] for item in extra_items)
+			data.sort(
+				key=lambda item: (str(item.get("created_at") or ""), int(item.get("id") or 0)),
+				reverse=True,
+			)
+		return _json_response(_serialize_history_items(data))
+	finally:
+		db.close()
+
+
+@app.route("/api/history/unresolved-replies/count")
+def api_history_unresolved_replies_count():
+	db = _get_web_db()
+	try:
+		return _json_response({"count": count_unresolved_monitor_items(db)})
+	finally:
+		db.close()
+
+
+@app.route("/api/history/<history_id>/open-chat", method="POST")
+def api_history_open_chat(history_id):
+	with job_mutation_lock:
+		conflict = _active_task_mutation_error()
+		if conflict is not None:
+			return conflict
+		db = _get_web_db()
+		try:
+			row = db.execute(
+				"""
+				SELECT j.*
+				FROM history h
+				JOIN jobs j ON j.id = h.job_id
+				WHERE h.id = ? AND j.deleted_at IS NULL
+				""",
+				(history_id,),
+			).fetchone()
+			if not row:
+				return _json_response({"error": "监测记录或岗位不存在"}, 404)
+			job = dict(row)
+		finally:
+			db.close()
+
+		if str(job.get("source_platform") or "boss") != "boss":
+			return _json_response({"error": "该平台不支持聊天定位"}, 400)
+
+		from bosshunter.executor.monitor import MonitorRiskDetected, _open_conversation_from_chat_list
+
+		try:
+			target_id = _open_conversation_from_chat_list(
+				job,
+				load_config(CONFIG_PATH),
+				background=False,
+			)
+		except MonitorRiskDetected as exc:
+			return _json_response({"error": f"BOSS 页面出现风险提示：{exc.kind}"}, 409)
+		if not target_id:
+			return _json_response({"error": "已打开 BOSS 聊天页，但没有找到对应联系人"}, 404)
+		return _json_response({"success": True, "message": "已定位到对应聊天对话"})
+
+
+@app.route("/api/history/<history_id>/prepare-reply", method="POST")
+def api_history_prepare_reply(history_id):
+	with job_mutation_lock:
+		conflict = _active_task_mutation_error()
+		if conflict is not None:
+			return conflict
+		db = _get_web_db()
+		try:
+			row = db.execute(
+				"SELECT id, job_id, action FROM history WHERE id = ?",
+				(history_id,),
+			).fetchone()
+			if not row:
+				return _json_response({"error": "待处理记录不存在"}, 404)
+			if row["action"] != "hr_reply_detected":
+				return _json_response({"error": "只能处理刚检测到的 HR 消息"}, 400)
+			resolved = db.execute(
+				"""
+				SELECT 1 FROM history
+				WHERE job_id = ? AND id > ?
+				  AND action IN (
+				    'reply_pending', 'needs_resume', 'resume_failed', 'resume_sent',
+				    'reply_dismissed', 'replied', 'auto_replied', 'rejected'
+				  )
+				LIMIT 1
+				""",
+				(row["job_id"], row["id"]),
+			).fetchone()
+			if resolved:
+				return _json_response({"success": True, "already_processed": True})
+			job_id = str(row["job_id"])
+		finally:
+			db.close()
+
+		from bosshunter.executor.monitor import process_detected_reply
+
+		summary = process_detected_reply(job_id, load_config(CONFIG_PATH))
+		if summary.get("stop_reason"):
+			return _json_response({"error": "读取 BOSS 对话时触发安全停止", "summary": summary}, 409)
+		processed = sum(
+			int(summary.get(key, 0) or 0)
+			for key in ("skipped", "pending", "needs_resume", "rejected", "replied")
+		)
+		if not processed and summary.get("failed"):
+			return _json_response({"error": "读取或处理对话失败，请先打开聊天对话检查", "summary": summary}, 502)
+		if not processed:
+			return _json_response({"error": "没有找到对应的新 HR 对话，请先用“打开聊天对话”检查"}, 404)
+		return _json_response({"success": True, "summary": summary})
+
+
+@app.route("/api/workbench")
+def api_workbench():
+	_ensure_scheduled_delivery_timer()
+	db = _get_web_db()
+	try:
+		config = load_config(CONFIG_PATH)
+		threshold = config.get("scoring", {}).get("threshold", 60)
+		daily_limit = int(config.get("throttle", {}).get("daily_limit", 30) or 30)
+		today_sent_row = db.execute(
+			"SELECT COUNT(*) AS cnt FROM history WHERE action='sent' AND date(created_at)=date('now')"
+		).fetchone()
+		today_sent = int(today_sent_row["cnt"] if today_sent_row else 0)
+		status = task_runner.status()
+		return _json_response({
+			"funnel": get_funnel_stats(db),
+			"funnel_today": get_funnel_stats(db, today=True),
+			"pending_confirmation": [
+				job for job in get_jobs_pending_confirmation(db)
+				if int(job.get("score") or 0) >= threshold
+				and platform_supports(str(job.get("source_platform") or "boss"), "deliver")
+			],
+			"pending_greetings": [
+				job for job in get_jobs_ready_to_send(db)
+				if platform_supports(str(job.get("source_platform") or "boss"), "deliver")
+			],
+			"send_errors": [
+				job for job in get_jobs_with_send_errors(db)
+				if platform_supports(str(job.get("source_platform") or "boss"), "deliver")
+			],
+			"needs_resume": [
+				job for job in get_jobs_needing_resume(db)
+				if platform_supports(str(job.get("source_platform") or "boss"), "deliver")
+			],
+			"send_quota": {
+				"daily_limit": daily_limit,
+				"sent": today_sent,
+				"remaining": max(daily_limit - today_sent, 0),
+				"exhausted": today_sent >= daily_limit,
+			},
+			"scheduled_delivery": _scheduled_delivery_snapshot(),
+			"scheduled_deliveries": _scheduled_delivery_snapshots(),
+			"task": status["active"],
+			"last_task": status["last_task"],
+		})
+	finally:
+		db.close()
+
+
+@app.route("/api/workbench/scheduled-delivery", method="POST")
+def api_workbench_schedule_delivery():
+	try:
+		body = request.json or {}
+		job_ids = [str(job_id) for job_id in body.get("job_ids", []) if str(job_id)]
+		if not job_ids:
+			return _json_response({"error": "请选择要定时投递的岗位"}, 400)
+		scheduled_at = _parse_scheduled_at(str(body.get("scheduled_at") or ""))
+		now = datetime.now()
+		if scheduled_at <= now:
+			return _json_response({"error": "定时投递时间必须晚于当前时间"}, 400)
+		if scheduled_at > now + timedelta(days=14):
+			return _json_response({"error": "定时投递最多可设置未来 14 天"}, 400)
+
+		config = load_config(CONFIG_PATH)
+		send_windows = config.get("throttle", {}).get("send_windows", [])
+		if isinstance(send_windows, list) and not _time_in_send_windows(scheduled_at, send_windows):
+			return _json_response({"error": "定时时间不在发送窗口内，请先在配置里修改发送时间"}, 400)
+
+		db = _get_web_db()
+		try:
+			placeholders = ",".join("?" for _ in job_ids)
+			rows = db.execute(
+				f"SELECT id, status, greeting, COALESCE(source_platform, 'boss') AS source_platform FROM jobs WHERE deleted_at IS NULL AND id IN ({placeholders})",
+				job_ids,
+			).fetchall()
+			row_map = {str(row["id"]): row for row in rows}
+			invalid_ids = [job_id for job_id in job_ids if job_id not in row_map]
+			if invalid_ids:
+				return _json_response({"error": "所选岗位不存在或已进入回收站", "invalid_ids": invalid_ids}, 409)
+			unsupported = [
+				job_id for job_id in job_ids
+				if not platform_supports(str(row_map[job_id]["source_platform"] or "boss"), "deliver")
+			]
+			if unsupported:
+				return _json_response({"error": "所选岗位的平台暂不支持定时投递", "invalid_ids": unsupported}, 403)
+			completed_statuses = {"sent", "replied", "resume_sent", "needs_resume", "follow_up_sent"}
+			not_ready_ids = [
+				job_id for job_id in job_ids
+				if str(row_map[job_id]["status"] or "") not in {"ready", "approved", "error"}
+			]
+			already_sent_ids = [
+				job_id for job_id in job_ids
+				if str(row_map[job_id]["status"] or "") in completed_statuses
+			]
+			missing_greeting_ids = [
+				job_id for job_id in job_ids
+				if not str(row_map[job_id]["greeting"] or "").strip()
+			]
+			if already_sent_ids or missing_greeting_ids or not_ready_ids:
+				return _json_response({
+					"error": "所选岗位包含尚未准备好、缺少招呼语或已经投递的岗位，暂不能定时投递",
+					"already_sent_ids": already_sent_ids,
+					"not_ready_ids": not_ready_ids,
+					"missing_greeting_ids": missing_greeting_ids,
+				}, 409)
+			for job_id in job_ids:
+				update_job_status(db, job_id, "approved")
+				add_history(db, job_id, "scheduled_delivery", f"Web Dashboard 定时投递：{scheduled_at.isoformat(timespec='minutes')}")
+		finally:
+			db.close()
+
+		payload = {
+			"id": str(uuid4()),
+			"status": "active",
+			"scheduled_at": scheduled_at.isoformat(timespec="seconds"),
+			"job_ids": job_ids,
+			"job_count": len(job_ids),
+			"message": "定时投递已设置",
+			"created_at": now.isoformat(timespec="seconds"),
+			"updated_at": now.isoformat(timespec="seconds"),
+		}
+		with scheduled_delivery_lock:
+			existing = _load_scheduled_deliveries()
+			incoming_ids = set(job_ids)
+			replaced = [
+				item for item in existing
+				if item.get("status") == "active"
+				and not incoming_ids.isdisjoint({str(job_id) for job_id in item.get("job_ids", [])})
+			]
+			kept = [
+				item for item in existing
+				if item.get("status") != "active"
+				or incoming_ids.isdisjoint({str(job_id) for job_id in item.get("job_ids", [])})
+			]
+			for item in replaced:
+				_cancel_scheduled_delivery_timer(str(item.get("id")))
+			_save_scheduled_deliveries([*kept, payload])
+		_arm_scheduled_delivery_timer(payload)
+		return _json_response(payload)
+	except ValueError as e:
+		return _json_response({"error": str(e)}, 400)
+	except Exception as e:
+		return _json_response({"error": str(e)}, 500)
+
+
+@app.route("/api/workbench/scheduled-delivery", method="DELETE")
+def api_workbench_cancel_scheduled_delivery():
+	with scheduled_delivery_lock:
+		schedule_id = str(request.params.get("id") or "").strip()
+		schedules = _load_scheduled_deliveries()
+		if schedule_id:
+			canceled = [item for item in schedules if item.get("id") == schedule_id]
+			remaining = [item for item in schedules if item.get("id") != schedule_id]
+			_cancel_scheduled_delivery_timer(schedule_id)
+			_save_scheduled_deliveries(remaining)
+			return _json_response({"success": True, "canceled": bool(canceled)})
+		_cancel_scheduled_delivery_timer()
+		_save_scheduled_deliveries([])
+	return _json_response({"success": True, "canceled": bool(schedules)})
+
+
+@app.route("/api/workbench/preflight", method=["GET", "POST"])
+def api_workbench_preflight():
+	body = request.json if request.method == "POST" else {}
+	body = body if isinstance(body, dict) else {}
+	mode = str(body.get("mode") or request.params.get("mode", ""))
+	options = body.get("options") if isinstance(body.get("options"), dict) else None
+	try:
+		config = load_config(CONFIG_PATH)
+		options = _resolve_collection_resume(mode, options)
+		checks = collect_preflight_checks(mode, config, options)
+		messages = error_messages(checks)
+		return _json_response({"ok": not messages, "messages": messages, "checks": checks})
+	except ValueError as e:
+		return _json_response({"ok": False, "messages": [str(e)]}, 400)
+	except Exception as e:
+		return _json_response({"ok": False, "messages": [str(e)]}, 500)
+
+
+@app.route("/api/diagnostics/ai")
+def api_ai_diagnostics():
+	try:
+		checks = check_ai_connection(load_config(CONFIG_PATH), required=True)
+		messages = error_messages(checks)
+		return _json_response({"ok": not messages, "messages": messages, "checks": checks})
+	except Exception as e:
+		return _json_response({"ok": False, "messages": [str(e)]}, 500)
+
+
+def _scoring_options_from_body(body: dict) -> dict:
+	raw_options = body.get("options", body)
+	if not isinstance(raw_options, dict):
+		raise ValueError("评分参数必须是对象")
+	options = validate_options(
+		raw_options.get("scope", "pending"),
+		raw_options.get("limit"),
+		raw_options.get("job_ids", []),
+		raw_options.get("force_rescore", False),
+	)
+	# This cap applies to IDs supplied by the page, not internally selected jobs.
+	if len(options["job_ids"]) > 1000:
+		raise ValueError("一次最多选择 1000 个岗位")
+	return options
+
+
+@app.route("/api/scoring/preview", method="POST")
+def api_scoring_preview():
+	try:
+		body = request.json or {}
+		if not isinstance(body, dict):
+			raise ValueError("请求体必须是对象")
+		options = _scoring_options_from_body(body)
+		config = load_config(CONFIG_PATH)
+		max_attempts = config.get("ai", {}).get("scoring_max_attempts", 2)
+		db = _get_web_db()
+		try:
+			return _json_response(preview_scoring(db, **options, max_attempts_per_job=max_attempts))
+		finally:
+			db.close()
+	except ValueError as exc:
+		return _json_response({"error": str(exc)}, 400)
+
+
+@app.route("/api/scoring/start", method="POST")
+def api_scoring_start():
+	run_id = str(uuid4())
+	db_path = DATA_DIR / "bosshunter.db"
+	try:
+		body = request.json or {}
+		if not isinstance(body, dict):
+			raise ValueError("请求体必须是对象")
+		options = _scoring_options_from_body(body)
+		# force=true 允许结束已暂停的旧评分记录后强制开新任务；running 任务不在此列（issue #100）。
+		# 只接受真正的布尔 true：bool("false") 也为真，异常请求会误触发强制重启（#117 review）。
+		force = body.get("force", False) is True
+		config = load_config(CONFIG_PATH)
+		messages = _preflight_messages("rescore", config)
+		if messages:
+			return _json_response({"error": "请先处理评分启动检查", "messages": messages}, 400)
+		active_runs = [run for run in list_scoring_runs(db_path, limit=100) if run.get("status") in {"running", "paused"}]
+		running_runs = [run for run in active_runs if run.get("status") == "running"]
+		paused_runs = [run for run in active_runs if run.get("status") == "paused"]
+		if running_runs:
+			return _json_response({"error": "已有独立评分任务正在运行，请等待其结束或先停止该任务"}, 409)
+		if paused_runs:
+			if not force:
+				return _json_response({
+					"error": "已有等待恢复的评分任务，请先继续或结束该任务；确认问题已修复后也可强制开始新任务",
+					"code": "scoring_run_paused",
+				}, 409)
+			for run in paused_runs:
+				update_scoring_run(
+					db_path,
+					str(run.get("id") or ""),
+					status="stopped",
+					error="已被新的评分任务强制结束",
+				)
+		db = _get_web_db()
+		try:
+			selected = select_scoring_jobs(db, **options)
+		finally:
+			db.close()
+		job_ids = [str(job["id"]) for job in selected]
+		if not job_ids:
+			return _json_response({"error": "没有符合条件的待评分岗位"}, 400)
+		stored_options = {
+			"scope": options["scope"],
+			"limit": options["limit"],
+			"force_rescore": options["force_rescore"],
+		}
+		create_scoring_run(db_path, run_id=run_id, options=stored_options, job_ids=job_ids)
+		runtime_options = {"job_ids": job_ids, "force_rescore": options["force_rescore"]}
+		with job_mutation_lock:
+			update_scoring_run(db_path, run_id, status="running")
+			task = task_runner.start("score", _task_config({
+				"_score_run_id": run_id,
+				"_score_options": runtime_options,
+			}))
+		update_scoring_run(db_path, run_id, task_id=str(task["id"]))
+		return _json_response({"run": get_scoring_run(db_path, run_id), "task": task})
+	except TaskAlreadyRunningError as exc:
+		update_scoring_run(db_path, run_id, status="stopped", error=str(exc))
+		return _json_response({"error": str(exc)}, 409)
+	except ValueError as exc:
+		return _json_response({"error": str(exc)}, 400)
+	except Exception as exc:
+		update_scoring_run(db_path, run_id, status="failed", error=str(exc)[:1000])
+		return _json_response({"error": "启动评分失败"}, 500)
+
+
+@app.route("/api/scoring/runs")
+def api_scoring_runs():
+	return _json_response(list_scoring_runs(DATA_DIR / "bosshunter.db"))
+
+
+@app.route("/api/scoring/runs/<run_id>/pause", method="POST")
+def api_scoring_pause(run_id):
+	db_path = DATA_DIR / "bosshunter.db"
+	run = get_scoring_run(db_path, run_id)
+	if not run:
+		return _json_response({"error": "评分任务不存在"}, 404)
+	if run.get("status") != "running":
+		return _json_response(run)
+	try:
+		task = task_runner.stop(str(run.get("task_id") or ""), "用户暂停独立评分")
+	except KeyError:
+		task = {"status": "stopped"}
+	latest = get_scoring_run(db_path, run_id) or run
+	if task.get("status") not in {"completed", "failed"} and latest.get("remaining_job_ids"):
+		latest = update_scoring_run(db_path, run_id, status="paused", pause_reason="用户暂停独立评分") or latest
+	return _json_response(latest)
+
+
+@app.route("/api/scoring/runs/<run_id>/resume", method="POST")
+def api_scoring_resume(run_id):
+	db_path = DATA_DIR / "bosshunter.db"
+	run = get_scoring_run(db_path, run_id)
+	if not run:
+		return _json_response({"error": "评分任务不存在"}, 404)
+	if run.get("status") != "paused":
+		return _json_response({"error": "只有已暂停的评分任务可以恢复"}, 409)
+	remaining = [str(job_id) for job_id in run.get("remaining_job_ids", []) if str(job_id)]
+	if not remaining:
+		return _json_response({"error": "该评分任务没有剩余岗位"}, 400)
+	config = load_config(CONFIG_PATH)
+	messages = _preflight_messages("rescore", config)
+	if messages:
+		return _json_response({"error": "请先处理评分启动检查", "messages": messages}, 400)
+	force_rescore = bool(run.get("options", {}).get("force_rescore"))
+	db = _get_web_db()
+	try:
+		eligible = select_scoring_jobs(
+			db,
+			scope="selected",
+			limit=None,
+			job_ids=remaining,
+			force_rescore=force_rescore,
+		)
+	finally:
+		db.close()
+	remaining = [str(job["id"]) for job in eligible]
+	if not remaining:
+		completed = update_scoring_run(db_path, run_id, status="completed", remaining_job_ids=[])
+		return _json_response(completed)
+	try:
+		with job_mutation_lock:
+			update_scoring_run(db_path, run_id, status="running", remaining_job_ids=remaining)
+			task = task_runner.start("score", _task_config({
+				"_score_run_id": run_id,
+				"_score_options": {"job_ids": remaining, "force_rescore": force_rescore},
+			}))
+		update_scoring_run(db_path, run_id, task_id=str(task["id"]))
+		return _json_response({"run": get_scoring_run(db_path, run_id), "task": task})
+	except TaskAlreadyRunningError as exc:
+		update_scoring_run(db_path, run_id, status="paused", pause_reason=str(exc))
+		return _json_response({"error": str(exc)}, 409)
+
+
+@app.route("/api/scoring/runs/<run_id>/end", method="POST")
+def api_scoring_end(run_id):
+	db_path = DATA_DIR / "bosshunter.db"
+	run = get_scoring_run(db_path, run_id)
+	if not run:
+		return _json_response({"error": "评分任务不存在"}, 404)
+	if run.get("status") == "running" and run.get("task_id"):
+		try:
+			task_runner.stop(str(run["task_id"]), "用户结束独立评分")
+		except KeyError:
+			pass
+	ended = update_scoring_run(db_path, run_id, status="stopped", remaining_job_ids=[])
+	return _json_response(ended)
+
+
+def _resolve_collection_resume(mode: str, options: dict | None) -> dict | None:
+	if options and options.get("resume_run_id"):
+		if mode != "collect" or not isinstance(options["resume_run_id"], str):
+			raise ValueError("请在岗位采集中继续原 BOSS 任务")
+		return boss_resume_options(DATA_DIR / "bosshunter.db", options["resume_run_id"])
+	return options
+
+
+@app.route("/api/workbench/task", method="POST")
+def api_workbench_task_start():
+	try:
+		body = request.json or {}
+		if not isinstance(body, dict):
+			return _json_response({"error": "请求体必须是对象"}, 400)
+		mode = str(body.get("mode", ""))
+		base_config = load_config(CONFIG_PATH)
+		options = body.get("options") if isinstance(body.get("options"), dict) else None
+		try:
+			options = _resolve_collection_resume(mode, options)
+		except ValueError as exc:
+			return _json_response({"error": str(exc)}, 400)
+		collection_options = None
+		if mode == "collect":
+			try:
+				collection_options = normalize_collection_options(base_config, options)
+			except ValueError as exc:
+				return _json_response({"error": str(exc)}, 400)
+		elif mode == "full":
+			try:
+				collection_options = normalize_collection_options(base_config, options)
+			except ValueError as exc:
+				return _json_response({"error": str(exc)}, 400)
+			collection_only = [
+				platform for platform in collection_options["platform_order"]
+				if not platform_supports(platform, "deliver")
+			]
+			if collection_only:
+				return _json_response({
+					"error": "智联和前程无忧当前只支持单独采集，不能进入发送全流程",
+					"collection_only_platforms": collection_only,
+				}, 400)
+			collection_options["auto_score"] = True
+		messages = _preflight_messages(mode, base_config, collection_options)
+		if messages:
+			return _json_response({"error": "请先处理启动前检查", "messages": messages}, 400)
+		extra = {"_collection_options": collection_options} if collection_options is not None else {}
+		before_start = None
+		if collection_options is not None and not collection_options.get("resume_run_id"):
+			# Persist only non-secret collection preferences so the next dialog can
+			# restore each platform's independent fields and queue order.
+			base_config["collection"] = {
+				**(base_config.get("collection") if isinstance(base_config.get("collection"), dict) else {}),
+				"default_order": collection_options["platform_order"],
+				"auto_score_default": collection_options["auto_score"],
+			}
+			platform_configs = deepcopy(base_config.get("platforms")) if isinstance(base_config.get("platforms"), dict) else {}
+			selected_platforms = set(collection_options["platform_order"])
+			for platform, value in collection_options["platforms"].items():
+				platform_configs[platform] = {
+					**(platform_configs.get(platform) if isinstance(platform_configs.get(platform), dict) else {}),
+					"enabled": platform in selected_platforms,
+					"search": value,
+				}
+			for platform in ("boss", "zhilian", "51job"):
+				if platform not in selected_platforms and isinstance(platform_configs.get(platform), dict):
+					platform_configs[platform]["enabled"] = False
+			base_config["platforms"] = platform_configs
+			before_start = lambda: _write_config(base_config)
+		with job_mutation_lock:
+			task = task_runner.start(mode, {**base_config, **extra}, before_start=before_start)
+		return _json_response(task)
+	except TaskAlreadyRunningError as e:
+		return _json_response({"error": str(e)}, 409)
+	except Exception as e:
+		return _json_response({"error": str(e)}, 500)
+
+
+@app.route("/api/workbench/prepare-greetings", method="POST")
+def api_workbench_prepare_greetings():
+	try:
+		body = request.json or {}
+		job_ids = [str(job_id) for job_id in body.get("job_ids", []) if str(job_id)]
+		if not job_ids:
+			return _json_response({"error": "请选择要加入预投递的岗位"}, 400)
+		validation_db = _get_web_db()
+		try:
+			placeholders = ",".join("?" for _ in job_ids)
+			active_ids = {
+				str(row["id"])
+				for row in validation_db.execute(
+					f"SELECT id FROM jobs WHERE deleted_at IS NULL AND id IN ({placeholders})",
+					job_ids,
+				).fetchall()
+			}
+			rows = validation_db.execute(
+				f"SELECT id, status, COALESCE(source_platform, 'boss') AS source_platform FROM jobs WHERE deleted_at IS NULL AND id IN ({placeholders})",
+				job_ids,
+			).fetchall()
+		finally:
+			validation_db.close()
+		invalid_ids = [job_id for job_id in job_ids if job_id not in active_ids]
+		if invalid_ids:
+			return _json_response({"error": "所选岗位不存在或已进入回收站", "invalid_ids": invalid_ids}, 409)
+		unsupported = [
+			str(row["id"])
+			for row in rows
+			if not platform_supports(str(row["source_platform"] or "boss"), "deliver")
+		]
+		if unsupported:
+			return _json_response({
+				"error": "所选岗位的平台暂不支持预投递发送链路",
+				"invalid_ids": unsupported,
+			}, 403)
+		allowed_statuses = {"ready", "approved", "error"}
+		completed_statuses = {"sent", "replied", "resume_sent", "needs_resume", "follow_up_sent"}
+		not_ready_ids = [
+			str(row["id"])
+			for row in rows
+			if str(row["status"] or "") not in allowed_statuses
+			and str(row["status"] or "") not in completed_statuses
+		]
+		already_sent_ids = [
+			str(row["id"])
+			for row in rows
+			if str(row["status"] or "") in completed_statuses
+		]
+		if already_sent_ids or not_ready_ids:
+			if already_sent_ids and not not_ready_ids:
+				error = "所选岗位已经投递，不能重复加入预投递"
+			elif not_ready_ids and not already_sent_ids:
+				error = "所选岗位尚未完成评分筛选或人工确认，暂不能加入预投递"
+			else:
+				error = "所选岗位包含尚未准备好或已经投递的岗位，暂不能加入预投递"
+			return _json_response({
+				"error": error,
+				"already_sent_ids": already_sent_ids,
+				"not_ready_ids": not_ready_ids,
+			}, 409)
+
+		def mark_approved() -> None:
+			db = _get_web_db()
+			try:
+				for job_id in job_ids:
+					update_job_status(db, job_id, "approved")
+					add_history(db, job_id, "pre_delivery", "Web Dashboard 加入预投递")
+			finally:
+				db.close()
+
+		with job_mutation_lock:
+			task = task_runner.start(
+				"prepare",
+				_task_config({"_workbench_job_ids": job_ids}),
+				before_start=mark_approved,
+			)
+		return _json_response(task)
+	except TaskAlreadyRunningError as e:
+		return _json_response({"error": str(e)}, 409)
+	except Exception as e:
+		return _json_response({"error": str(e)}, 500)
+
+
+@app.route("/api/collection/runs")
+def api_collection_runs():
+	try:
+		limit = int(request.params.get("limit", 20))
+		return _json_response(list_collection_runs(DATA_DIR / "bosshunter.db", limit=limit))
+	except (TypeError, ValueError) as exc:
+		return _json_response({"error": str(exc)}, 400)
+
+
+@app.route("/api/collection/runs/<run_id>")
+def api_collection_run_detail(run_id):
+	run = get_collection_run(DATA_DIR / "bosshunter.db", run_id)
+	if not run:
+		return _json_response({"error": "采集运行记录不存在"}, 404)
+	return _json_response(run)
+
+
+@app.route("/api/workbench/task/<task_id>/stop", method="POST")
+def api_workbench_task_stop(task_id):
+	try:
+		return _json_response(task_runner.stop(task_id))
+	except KeyError:
+		return _json_response({"error": "任务不存在"}, 404)
+	except Exception as e:
+		return _json_response({"error": str(e)}, 500)
+
+
+@app.route("/api/workbench/deliver", method="POST")
+def api_workbench_deliver():
+	try:
+		body = request.json or {}
+		job_ids = [str(job_id) for job_id in body.get("job_ids", []) if str(job_id)]
+		if not job_ids:
+			return _json_response({"error": "请选择要投递的岗位"}, 400)
+		direct_send = bool(body.get("direct_send"))
+		validation_db = _get_web_db()
+		try:
+			placeholders = ",".join("?" for _ in job_ids)
+			active_ids = {
+				str(row["id"])
+				for row in validation_db.execute(
+					f"SELECT id FROM jobs WHERE deleted_at IS NULL AND id IN ({placeholders})",
+					job_ids,
+				).fetchall()
+			}
+			platform_rows = validation_db.execute(
+				f"SELECT id, status, greeting, COALESCE(source_platform, 'boss') AS source_platform FROM jobs WHERE deleted_at IS NULL AND id IN ({placeholders})",
+				job_ids,
+			).fetchall()
+		finally:
+			validation_db.close()
+		invalid_ids = [job_id for job_id in job_ids if job_id not in active_ids]
+		if invalid_ids:
+			return _json_response({"error": "所选岗位不存在或已进入回收站", "invalid_ids": invalid_ids}, 409)
+		unsupported = [
+			str(row["id"])
+			for row in platform_rows
+			if not platform_supports(str(row["source_platform"] or "boss"), "deliver")
+		]
+		if unsupported:
+			return _json_response({
+				"error": "所选岗位的平台暂不支持投递动作",
+				"unsupported_platform": "unknown",
+				"invalid_ids": unsupported,
+			}, 403)
+		allowed_statuses = {"ready", "approved", "error"} if direct_send else {"ready", "approved"}
+		completed_statuses = {"sent", "replied", "resume_sent", "needs_resume", "follow_up_sent"}
+		already_sent_ids = {
+			str(row["id"])
+			for row in platform_rows
+			if str(row["status"] or "") in completed_statuses
+		}
+		missing_greeting_ids = {
+			str(row["id"])
+			for row in platform_rows
+			if direct_send
+			and str(row["status"] or "") in allowed_statuses
+			and not str(row["greeting"] or "").strip()
+		}
+		not_ready_ids = {
+			str(row["id"])
+			for row in platform_rows
+			if str(row["status"] or "") not in allowed_statuses
+			and str(row["status"] or "") not in completed_statuses
+		}
+		invalid_status_ids = [
+			job_id
+			for job_id in job_ids
+			if job_id in already_sent_ids or job_id in missing_greeting_ids or job_id in not_ready_ids
+		]
+		if invalid_status_ids:
+			if already_sent_ids and not missing_greeting_ids and not not_ready_ids:
+				error = "所选岗位已经投递，不能重复发送"
+			elif missing_greeting_ids and not already_sent_ids and not not_ready_ids:
+				error = "所选岗位尚未生成招呼语，不能直接发送"
+			elif not_ready_ids and not already_sent_ids and not missing_greeting_ids:
+				error = "所选岗位尚未完成评分筛选或人工确认，暂不能投递"
+			else:
+				error = "所选岗位包含尚未准备好、缺少招呼语或已经投递的岗位，暂不能投递"
+			return _json_response({
+				"error": error,
+				"invalid_ids": invalid_status_ids,
+				"already_sent_ids": [job_id for job_id in job_ids if job_id in already_sent_ids],
+				"not_ready_ids": [job_id for job_id in job_ids if job_id in not_ready_ids],
+				"missing_greeting_ids": [job_id for job_id in job_ids if job_id in missing_greeting_ids],
+			}, 409)
+
+		status = task_runner.status()
+		active_task = status.get("active") or {}
+		active_runtime_task = task_runner._tasks.get(active_task.get("id"))
+		monitoring_task = None
+		if (
+			active_runtime_task
+			and active_runtime_task.status == "running"
+			and active_runtime_task.context.get("monitoring")
+		):
+			monitoring_task = active_runtime_task
+		delivery_task = None
+		if (
+			active_runtime_task
+			and active_runtime_task.status == "running"
+			and active_runtime_task.context.get("delivering")
+		):
+			delivery_task = active_runtime_task
+		waiting_task = None
+		if (
+			not direct_send
+			and active_runtime_task
+			and active_runtime_task.mode == "full"
+			and active_runtime_task.status == "running"
+			and not monitoring_task
+			and not delivery_task
+			and not active_runtime_task.context.get("confirmation_complete")
+		):
+			waiting_task = active_runtime_task
+		if active_task and not waiting_task and not monitoring_task and not delivery_task:
+			raise TaskAlreadyRunningError(
+				f"当前已有后台任务「{active_task.get('label', '未知任务')}」正在运行或停止中，请等待其完全结束"
+			)
+
+		queued_payload = None
+		status_job_ids = job_ids
+		if delivery_task:
+			queued_payload, status_job_ids = _queue_active_delivery(
+				delivery_task,
+				job_ids,
+				direct_send=direct_send,
+			)
+
+		db = _get_web_db()
+		try:
+			for job_id in status_job_ids:
+				update_job_status(db, job_id, "approved")
+				if not direct_send:
+					add_history(db, job_id, "approved", "Web Dashboard 确认投递")
+		finally:
+			db.close()
+
+		if queued_payload is not None:
+			return _json_response(queued_payload)
+
+		if waiting_task:
+			waiting_task.context["confirmed_job_ids"] = job_ids
+			waiting_task.context["delivery_requested"] = True
+			confirmation_event = waiting_task.context.get("confirmation_event")
+			if isinstance(confirmation_event, Event):
+				confirmation_event.set()
+			return _json_response(waiting_task.snapshot())
+
+		if monitoring_task:
+			return _json_response(
+				_queue_monitor_delivery(
+					monitoring_task,
+					job_ids,
+					direct_send=direct_send,
+				)
+			)
+
+		deliver_options = {"_workbench_job_ids": job_ids}
+		if direct_send:
+			deliver_options["_workbench_skip_greeting"] = True
+		task = task_runner.start("deliver", _task_config(deliver_options))
+		return _json_response(task)
+	except TaskAlreadyRunningError as e:
+		return _json_response({"error": str(e)}, 409)
+	except Exception as e:
+		return _json_response({"error": str(e)}, 500)
+
+
+@app.route("/api/workbench/reject", method="POST")
+def api_workbench_reject():
+	try:
+		body = request.json or {}
+		job_ids = [str(job_id) for job_id in body.get("job_ids", []) if str(job_id)]
+		if not job_ids:
+			return _json_response({"error": "请选择要放弃的岗位"}, 400)
+
+		db = _get_web_db()
+		try:
+			placeholders = ",".join("?" for _ in job_ids)
+			active_ids = {
+				str(row["id"])
+				for row in db.execute(
+					f"SELECT id FROM jobs WHERE deleted_at IS NULL AND id IN ({placeholders})",
+					job_ids,
+				).fetchall()
+			}
+			invalid_ids = [job_id for job_id in job_ids if job_id not in active_ids]
+			if invalid_ids:
+				return _json_response({"error": "所选岗位不存在或已进入回收站", "invalid_ids": invalid_ids}, 409)
+			for job_id in job_ids:
+				update_job_status(db, job_id, "rejected")
+				add_history(db, job_id, "rejected", "Web Dashboard 放弃投递")
+		finally:
+			db.close()
+
+		return _json_response({"success": True, "count": len(job_ids)})
+	except Exception as e:
+		return _json_response({"error": str(e)}, 500)
+
+
+@app.route("/api/jobs/<job_id>")
+def api_job_detail(job_id):
+	db = _get_web_db()
+	try:
+		row = db.execute("SELECT * FROM jobs WHERE id = ? AND deleted_at IS NULL", (job_id,)).fetchone()
+		if not row:
+			return _json_response({"error": "岗位不存在"}, 404)
+		return _json_response(dict(row))
+	finally:
+		db.close()
+
+
+@app.route("/api/jobs/<job_id>/greeting", method="PUT")
+def api_job_greeting_save(job_id):
+	body = request.json or {}
+	greeting = str(body.get("greeting") or "").strip()
+	if not greeting:
+		return _json_response({"error": "招呼语不能为空"}, 400)
+	if len(greeting) > 500:
+		return _json_response({"error": "招呼语过长，请控制在 500 字以内"}, 400)
+
+	db = _get_web_db()
+	try:
+		row = db.execute("SELECT id, status FROM jobs WHERE id = ? AND deleted_at IS NULL", (job_id,)).fetchone()
+		if not row:
+			return _json_response({"error": "岗位不存在"}, 404)
+		if str(row["status"] or "") in {"sent", "replied", "resume_sent", "needs_resume", "follow_up_sent"}:
+			return _json_response({"error": "该岗位已进入后续流程，不能再修改招呼语"}, 409)
+		update_job_greeting(db, job_id, greeting)
+		add_history(db, job_id, "greeting_edited", "Web Dashboard 编辑招呼语")
+		return _json_response({"success": True, "greeting": greeting})
+	finally:
+		db.close()
+
+
+@app.route("/api/jobs/<job_id>/greeting/regenerate", method="POST")
+def api_job_greeting_regenerate(job_id):
+	try:
+		db = _get_web_db()
+		try:
+			row = db.execute(
+				"SELECT id, status, COALESCE(source_platform, 'boss') AS source_platform FROM jobs WHERE id = ? AND deleted_at IS NULL",
+				(job_id,),
+			).fetchone()
+		finally:
+			db.close()
+		if not row:
+			return _json_response({"error": "岗位不存在"}, 404)
+		if not platform_supports(str(row["source_platform"] or "boss"), "deliver"):
+			return _json_response({"error": "该平台暂不支持生成预投递招呼语"}, 403)
+		if str(row["status"] or "") in {"sent", "replied", "resume_sent", "needs_resume", "follow_up_sent"}:
+			return _json_response({"error": "该岗位已进入后续流程，不能重新生成招呼语"}, 409)
+		if str(row["status"] or "") not in {"ready", "approved", "error"}:
+			return _json_response({"error": "该岗位尚未完成评分筛选或人工确认，暂不能重新生成招呼语"}, 409)
+
+		def mark_for_regeneration() -> None:
+			mutation_db = _get_web_db()
+			try:
+				update_job_status(mutation_db, job_id, "approved")
+				add_history(mutation_db, job_id, "greeting_regenerate_requested", "Web Dashboard 重新生成招呼语")
+			finally:
+				mutation_db.close()
+
+		with job_mutation_lock:
+			task = task_runner.start(
+				"prepare",
+				_task_config({
+					"_workbench_job_ids": [job_id],
+					"_workbench_force_greeting_regenerate": True,
+				}),
+				before_start=mark_for_regeneration,
+			)
+		return _json_response(task)
+	except TaskAlreadyRunningError as e:
+		return _json_response({"error": str(e)}, 409)
+	except Exception as e:
+		return _json_response({"error": str(e)}, 500)
+
+
+@app.route("/api/jobs/<job_id>/score-trace")
+def api_job_score_trace(job_id):
+	"""Expose the latest validated score explanation without changing job-list payloads."""
+	db = _get_web_db()
+	try:
+		job = db.execute(
+			"SELECT id, status, score_reason FROM jobs WHERE id = ? AND deleted_at IS NULL",
+			(job_id,),
+		).fetchone()
+		if not job:
+			return _json_response({"error": "job_not_found"}, 404)
+		found, stored_trace = get_score_trace(db, job_id)
+		trace = sanitize_score_trace(stored_trace) if found else None
+		if trace is not None:
+			return _json_response({"job_id": job_id, "state": "available", "trace": trace})
+		state = "unavailable" if found else _score_trace_missing_state(dict(job))
+		return _json_response({"job_id": job_id, "state": state})
+	finally:
+		db.close()
+
+
+@app.route("/api/jobs/<job_id>/mark-resume-sent", method="POST")
+def api_job_mark_resume_sent(job_id):
+	db = _get_web_db()
+	try:
+		row = db.execute("SELECT source_platform FROM jobs WHERE id = ? AND deleted_at IS NULL", (job_id,)).fetchone()
+		if not row:
+			return _json_response({"error": "岗位不存在或已进入回收站"}, 404)
+		if not platform_supports(str(row["source_platform"] or "boss"), "deliver"):
+			return _json_response({"error": "该岗位来源平台当前不支持投递或简历发送链路"}, 403)
+		update_job_status(db, job_id, "resume_sent")
+		add_history(db, job_id, "resume_sent", "Web Dashboard 标记定制简历已发送")
+		return _json_response({"success": True})
+	finally:
+		db.close()
+
+
+@app.route("/api/jobs/<job_id>/resume/download")
+def api_job_resume_download(job_id):
+	db = _get_web_db()
+	try:
+		row = db.execute("SELECT resume_path FROM jobs WHERE id = ? AND deleted_at IS NULL", (job_id,)).fetchone()
+		if not row or not row["resume_path"]:
+			return _json_response({"error": "定制简历不存在"}, 404)
+		resume_path = Path(row["resume_path"])
+		if not resume_path.exists():
+			return _json_response({"error": "定制简历文件不存在"}, 404)
+		return static_file(resume_path.name, root=str(resume_path.parent), download=resume_path.name)
+	finally:
+		db.close()
+
+
+@app.route("/api/jobs/<job_id>/outreach-resume")
+def api_job_outreach_resume(job_id):
+	"""Return the editable source and review state without exposing local paths."""
+	db = _get_web_db()
+	try:
+		row = db.execute(
+			"SELECT * FROM jobs WHERE id = ? AND deleted_at IS NULL", (job_id,)
+		).fetchone()
+		if not row:
+			return _json_response({"error": "岗位不存在"}, 404)
+		job = dict(row)
+		markdown_text = ""
+		source_value = str(job.get("resume_source_path") or "")
+		if source_value:
+			source_path = Path(source_value)
+			if source_path.exists():
+				markdown_text = source_path.read_text(encoding="utf-8")
+		return _json_response({
+			"status": job.get("resume_review_status") or "missing",
+			"source": job.get("resume_generation_source"),
+			"failure_reason": job.get("resume_failure_reason"),
+			"reviewed_at": job.get("resume_reviewed_at"),
+			"markdown": markdown_text,
+			"image_url": f"/api/jobs/{job_id}/outreach-resume/image" if job.get("resume_image_path") else None,
+		})
+	finally:
+		db.close()
+
+
+@app.route("/api/jobs/<job_id>/outreach-resume", method="PUT")
+def api_job_outreach_resume_save(job_id):
+	body = request.json or {}
+	markdown_text = str(body.get("markdown") or "")
+	if len(markdown_text) > 30000:
+		return _json_response({"error": "图片简历内容过长"}, 400)
+	source = "codex" if body.get("source") == "codex" else "human_edit"
+	try:
+		from bosshunter.ai.resume import save_resume_draft
+
+		result = save_resume_draft(job_id, markdown_text, _task_config(), source=source)
+		db = _get_web_db()
+		try:
+			add_history(db, job_id, "outreach_resume_edited", f"已保存并重新渲染图片简历，来源：{source}")
+		finally:
+			db.close()
+		return _json_response({"success": True, "status": "needs_review", "resume_path": result.name})
+	except KeyError:
+		return _json_response({"error": "岗位不存在"}, 404)
+	except ValueError as exc:
+		return _json_response({"error": str(exc)}, 409)
+	except Exception as exc:
+		return _json_response({"error": f"保存图片简历失败：{exc}"}, 500)
+
+
+@app.route("/api/jobs/<job_id>/outreach-resume/review", method="POST")
+def api_job_outreach_resume_review(job_id):
+	body = request.json or {}
+	if body.get("confirmed") is not True:
+		return _json_response({"error": "确认图片简历需要 confirmed=true"}, 400)
+	db = _get_web_db()
+	try:
+		row = db.execute(
+			"SELECT resume_image_path FROM jobs WHERE id = ? AND deleted_at IS NULL", (job_id,)
+		).fetchone()
+		if not row:
+			return _json_response({"error": "岗位不存在"}, 404)
+		image_path = Path(str(row["resume_image_path"] or ""))
+		if not row["resume_image_path"] or not image_path.exists():
+			return _json_response({"error": "图片简历不存在，请先生成或保存草稿"}, 409)
+		db.execute(
+			"""
+			UPDATE jobs
+			SET resume_review_status = 'ready', resume_reviewed_at = CURRENT_TIMESTAMP,
+				resume_failure_reason = NULL, updated_at = CURRENT_TIMESTAMP
+			WHERE id = ? AND deleted_at IS NULL
+			""",
+			(job_id,),
+		)
+		add_history(db, job_id, "outreach_resume_reviewed", "用户已确认图片简历的事实、隐私和版式")
+		return _json_response({"success": True, "status": "ready"})
+	finally:
+		db.close()
+
+
+@app.route("/api/jobs/<job_id>/outreach-resume/image")
+def api_job_outreach_resume_image(job_id):
+	db = _get_web_db()
+	try:
+		row = db.execute(
+			"SELECT resume_image_path FROM jobs WHERE id = ? AND deleted_at IS NULL", (job_id,)
+		).fetchone()
+		if not row or not row["resume_image_path"]:
+			return _json_response({"error": "图片简历不存在"}, 404)
+		image_path = Path(str(row["resume_image_path"]))
+		if not image_path.exists():
+			return _json_response({"error": "图片简历文件不存在"}, 404)
+		download = request.params.get("download", "").lower() in {"1", "true", "yes"}
+		return static_file(
+			image_path.name,
+			root=str(image_path.parent),
+			download=image_path.name if download else False,
+		)
+	finally:
+		db.close()
+
+
+@app.route("/api/history/<history_id>/reply", method="POST")
+def api_history_reply(history_id):
+	with job_mutation_lock:
+		return _api_history_reply_locked(history_id)
+
+
+def _api_history_reply_locked(history_id):
+	db = _get_web_db()
+	try:
+		body = request.json or {}
+		message = str(body.get("message", "")).strip()
+		if not message:
+			return _json_response({"error": "回复内容不能为空"}, 400)
+
+		row = db.execute(
+			"SELECT id, job_id, action, detail FROM history WHERE id = ?",
+			(history_id,),
+		).fetchone()
+		if not row:
+			return _json_response({"error": "待回复记录不存在"}, 404)
+		if row["action"] != "reply_pending":
+			return _json_response({"error": "只能确认待回复记录"}, 400)
+		latest_pending = db.execute(
+			"SELECT MAX(id) AS id FROM history WHERE job_id = ? AND action = 'reply_pending'",
+			(row["job_id"],),
+		).fetchone()
+		if not latest_pending or int(latest_pending["id"] or 0) != int(row["id"]):
+			return _json_response({"error": "这条建议已不是最新一轮，请刷新后处理最新消息"}, 409)
+		already_resolved = db.execute(
+			"""
+			SELECT 1
+			FROM history
+			WHERE job_id = ?
+			  AND id > ?
+			  AND action IN ('reply_dismissed', 'replied', 'auto_replied')
+			LIMIT 1
+			""",
+			(row["job_id"], row["id"]),
+		).fetchone()
+		if already_resolved:
+			return _json_response({"success": True, "already_resolved": True, "message": "这轮回复已处理。"})
+
+		from bosshunter.executor.monitor import _build_reply_resolution_detail
+
+		add_history(
+			db,
+			row["job_id"],
+			"replied",
+			_build_reply_resolution_detail(
+				"replied.v1",
+				"Web Dashboard 确认回复",
+				row["detail"],
+				message,
+				int(row["id"]),
+			),
+		)
+		update_job_status(db, row["job_id"], "replied")
+		return _json_response({"success": True, "message": "回复已记录，请在招聘平台手动发送。"})
+	except Exception as e:
+		return _json_response({"error": str(e)}, 500)
+	finally:
+		db.close()
+
+
+@app.route("/api/history/<history_id>/dismiss", method="POST")
+def api_history_dismiss(history_id):
+	with job_mutation_lock:
+		return _api_history_dismiss_locked(history_id)
+
+
+def _api_history_dismiss_locked(history_id):
+	db = _get_web_db()
+	try:
+		row = db.execute(
+			"SELECT id, job_id, action, detail FROM history WHERE id = ?",
+			(history_id,),
+		).fetchone()
+		if not row:
+			return _json_response({"error": "待回复记录不存在"}, 404)
+		if row["action"] != "reply_pending":
+			return _json_response({"error": "只能放弃待回复记录"}, 400)
+		latest_pending = db.execute(
+			"SELECT MAX(id) AS id FROM history WHERE job_id = ? AND action = 'reply_pending'",
+			(row["job_id"],),
+		).fetchone()
+		if not latest_pending or int(latest_pending["id"] or 0) != int(row["id"]):
+			return _json_response({"error": "这条建议已不是最新一轮，请刷新后处理最新消息"}, 409)
+		already_resolved = db.execute(
+			"""
+			SELECT 1
+			FROM history
+			WHERE job_id = ?
+			  AND id > ?
+			  AND action IN ('reply_dismissed', 'replied', 'auto_replied')
+			LIMIT 1
+			""",
+			(row["job_id"], row["id"]),
+		).fetchone()
+		if already_resolved:
+			return _json_response({"success": True, "already_resolved": True, "message": "这轮回复已处理。"})
+
+		from bosshunter.executor.monitor import _build_reply_resolution_detail
+
+		add_history(
+			db,
+			row["job_id"],
+			"reply_dismissed",
+			_build_reply_resolution_detail(
+				"reply_dismissed.v1",
+				"Web Dashboard 放弃回复建议",
+				row["detail"],
+				pending_history_id=int(row["id"]),
+			),
+		)
+		return _json_response({"success": True})
+	finally:
+		db.close()
+
+
+@app.route("/api/history/<history_id>/resume-retry", method="POST")
+def api_history_resume_retry(history_id):
+	db = _get_web_db()
+	try:
+		row = db.execute(
+			"SELECT id, job_id, action, detail FROM history WHERE id = ?",
+			(history_id,),
+		).fetchone()
+		if not row:
+			return _json_response({"error": "简历失败记录不存在"}, 404)
+		if row["action"] != "resume_failed":
+			return _json_response({"error": "只能重试简历生成失败记录"}, 400)
+
+		job = db.execute(
+			"SELECT * FROM jobs WHERE id = ? AND deleted_at IS NULL",
+			(row["job_id"],),
+		).fetchone()
+		if not job:
+			return _json_response({"error": "对应岗位不存在或已删除"}, 404)
+
+		from bosshunter.ai.resume import generate_tailored_resume, get_last_resume_failure_reason
+
+		try:
+			resume_path = generate_tailored_resume(job["id"], _task_config())
+		except Exception as exc:
+			return _json_response({"error": f"重新生成失败：{exc}"}, 500)
+
+		if not resume_path:
+			reason = get_last_resume_failure_reason(job["id"]) or "定制简历生成失败，未获得更具体的错误信息"
+			add_history(
+				db,
+				job["id"],
+				"resume_failed",
+				json.dumps({
+					"schema": "resume_failed.v2",
+					"system_reason": reason,
+					"hr_question": "",
+					"conversation_tail": [],
+				}, ensure_ascii=False),
+			)
+			return _json_response({"error": reason}, 400)
+
+		current_status = str(job["status"] or "").strip()
+		if current_status not in {"replied", "resume_sent", "needs_resume", "follow_up_sent"}:
+			update_job_status(db, job["id"], "needs_resume")
+		history_detail = json.dumps({
+			"schema": "needs_resume.v1",
+			"message": f"Web Dashboard 重试生成定制简历成功，待手动发送: {resume_path}",
+			"resume_path": str(resume_path),
+		}, ensure_ascii=False)
+		add_history(db, job["id"], "needs_resume", history_detail)
+		return _json_response({"success": True, "resume_path": str(resume_path)})
+	except Exception as exc:
+		return _json_response({"error": str(exc)}, 500)
+	finally:
+		db.close()
+
+
+@app.route("/api/history/<history_id>/resume-dismiss", method="POST")
+def api_history_resume_dismiss(history_id):
+	db = _get_web_db()
+	try:
+		row = db.execute(
+			"SELECT id, job_id, action, detail FROM history WHERE id = ?",
+			(history_id,),
+		).fetchone()
+		if not row:
+			return _json_response({"error": "简历失败记录不存在"}, 404)
+		if row["action"] != "resume_failed":
+			return _json_response({"error": "只能忽略简历生成失败记录"}, 400)
+
+		add_history(
+			db,
+			row["job_id"],
+			"resume_failed_dismissed",
+			json.dumps({"schema": "resume_failed_dismissed.v1", "message": "Web Dashboard 忽略简历生成失败记录"}, ensure_ascii=False),
+		)
+		return _json_response({"success": True})
+	except Exception as exc:
+		return _json_response({"error": str(exc)}, 500)
+	finally:
+		db.close()
+
+
+# ─── Config APIs ─────────────────────────────────────────
+
+@app.route("/api/config")
+def api_config_get():
+	try:
+		config = _redact_config_for_response(load_config(CONFIG_PATH))
+		return _json_response(config)
+	except Exception as e:
+		return _json_response({"error": str(e)}, 500)
+
+
+@app.route("/api/config", method="POST")
+def api_config_post():
+	try:
+		import yaml
+		data = request.json
+		if not data:
+			return _json_response({"error": "Empty body"}, 400)
+		if not isinstance(data, dict):
+			return _json_response({"error": "Config body must be an object"}, 400)
+		data = _sanitize_config_for_write(data)
+
+		# Basic validation
+		profile = data.get("profile", {})
+		if profile.get("salary_min", 0) > profile.get("salary_max", 0) and profile.get("salary_max", 0) > 0:
+			return _json_response({"error": "salary_min must be <= salary_max"}, 400)
+		if (
+			profile.get("internship_daily_salary_min", 0) > profile.get("internship_daily_salary_max", 0)
+			and profile.get("internship_daily_salary_max", 0) > 0
+		):
+			return _json_response({"error": "internship_daily_salary_min must be <= internship_daily_salary_max"}, 400)
+
+		# Write YAML (backend exclusively owns YAML serialization)
+		_write_config(data)
+
+		return _json_response({"success": True, "message": "配置已保存"})
+	except Exception as e:
+		return _json_response({"error": str(e)}, 500)
+
+
+@app.route("/api/config/schema")
+def api_config_schema():
+	try:
+		with open(SCHEMA_PATH, "r", encoding="utf-8") as f:
+			schema = json.load(f)
+		return _json_response(schema)
+	except Exception as e:
+		return _json_response({"error": str(e)}, 500)
+
+
+@app.route("/api/config/download")
+def api_config_download():
+	if CONFIG_PATH.exists():
+		response.content_type = "application/x-yaml; charset=utf-8"
+		response.headers["Content-Disposition"] = "attachment; filename=config.yaml"
+		return _config_download_payload(load_config(CONFIG_PATH))
+	abort(404, "config.yaml not found")
+
+
+@app.route("/api/config/cities")
+def api_cities():
+	return _json_response(get_city_map(BASE_DIR))
+
+
+@app.route("/api/config/cities/lookup", method="POST")
+def api_city_lookup():
+	try:
+		body = request.json or {}
+		city = str(body.get("city") or "").strip()
+		city_code = get_city_map(BASE_DIR).get(city)
+		if city_code:
+			return _json_response({"name": city, "code": city_code})
+		return _json_response(lookup_city(city))
+	except CityLookupError as exc:
+		return _json_response({"error": str(exc)}, 400)
+
+
+@app.route("/api/cities")
+def api_city_snapshot():
+	platform = request.params.get("platform", "").strip().lower()
+	if platform == "zhilian":
+		snapshot = load_zhilian_city_snapshot()
+		return _json_response({
+			"ok": True,
+			"source": snapshot["source"],
+			"count": len(snapshot["cities"]),
+			"updated_at": snapshot.get("fetched_at"),
+			"note": snapshot.get("note", ""),
+			"cities": snapshot["cities"],
+		})
+	if platform == "51job":
+		snapshot = load_51job_city_snapshot()
+		return _json_response({
+			"ok": True,
+			"source": snapshot["source"],
+			"count": len(snapshot["cities"]),
+			"note": snapshot.get("note", ""),
+			"cities": snapshot["cities"],
+		})
+	try:
+		snapshot = load_city_snapshot(BASE_DIR)
+		return _json_response({
+			"ok": True,
+			"source": snapshot.get("source", "bundled"),
+			"count": len(snapshot.get("cities", [])),
+			"updated_at": snapshot.get("fetched_at"),
+			"cities": snapshot.get("cities", []),
+		})
+	except Exception:
+		return _json_response({
+			"ok": False,
+			"source": "bundled",
+			"count": 0,
+			"cities": [],
+			"error": "本地城市列表不可用",
+		}, 500)
+
+
+@app.route("/api/cities/refresh", method="POST")
+def api_city_refresh():
+	platform = request.params.get("platform", "").strip().lower()
+	if platform in {"zhilian", "51job"}:
+		label = "智联" if platform == "zhilian" else "51job"
+		return _json_response({
+			"ok": False,
+			"source": "local",
+			"using_local_data": True,
+			"error": f"{label}使用内置城市目录，不执行联网刷新；岗位采集窗口会根据城市名称自动匹配编码。",
+		}, 409)
+	try:
+		snapshot = refresh_city_cache(DATA_DIR / "cities.cache.json")
+		return _json_response({
+			"ok": True,
+			"source": "cache",
+			"count": len(snapshot.get("cities", [])),
+			"updated_at": snapshot.get("fetched_at"),
+			"cities": snapshot.get("cities", []),
+		})
+	except CityRefreshError as exc:
+		return _json_response({
+			"ok": False,
+			"source": "local",
+			"using_local_data": True,
+			"error": str(exc),
+		}, 502)
+
+
+@app.route("/api/jobs/export", method="POST")
+def api_jobs_export():
+	db = _get_web_db()
+	try:
+		body = request.json or {}
+		if not isinstance(body, dict):
+			return _json_response({"error": "请求体必须是对象"}, 400)
+		format_value = body.get("format", "xlsx")
+		scope = body.get("scope", "all")
+		job_ids = body.get("job_ids", [])
+		filters = body.get("filters", {})
+		if not isinstance(job_ids, list):
+			return _json_response({"error": "岗位 ID 必须是数组"}, 400)
+		if not isinstance(filters, dict):
+			return _json_response({"error": "筛选条件必须是对象"}, 400)
+		content, content_type, filename = export_jobs(
+			db,
+			format=format_value,
+			scope=scope,
+			job_ids=job_ids,
+			filters=filters,
+		)
+		exported_count = export_row_count(db, scope=scope, job_ids=job_ids, filters=filters)
+		response.content_type = content_type
+		response.headers["Content-Disposition"] = f'attachment; filename="{filename}"'
+		response.headers["Content-Length"] = str(len(content))
+		response.headers["X-Exported-Count"] = str(exported_count)
+		return content
+	except InvalidJobSelectionError as exc:
+		return _json_response({
+			"error": str(exc),
+			"code": "invalid_job_ids",
+			"invalid_ids": exc.invalid_ids,
+		}, 400)
+	except ValueError as exc:
+		return _json_response({"error": str(exc)}, 400)
+	except Exception:
+		return _json_response({"error": "岗位导出失败"}, 500)
+	finally:
+		db.close()
+
+
+def _job_action_payload():
+	body = request.json or {}
+	if not isinstance(body, dict):
+		raise ValueError("请求体必须是对象")
+	job_ids = body.get("job_ids")
+	if not isinstance(job_ids, list):
+		raise ValueError("岗位 ID 必须是数组")
+	return body, job_ids
+
+
+def _job_action_error(exc: ValueError):
+	payload = {"error": str(exc), "code": getattr(exc, "code", "invalid_request")}
+	if isinstance(exc, (JobDeletionConflictError, JobManualSentConflictError)):
+		payload["blocked"] = exc.blocked
+		payload["not_found"] = exc.not_found
+	return _json_response(payload, 409 if isinstance(exc, (JobDeletionConflictError, JobManualSentConflictError)) else 400)
+
+
+def _active_task_mutation_error():
+	active = task_runner.status().get("active")
+	if not active:
+		return None
+	return _json_response({
+		"error": f"当前后台任务「{active.get('label', '未知任务')}」仍在运行，请停止或等待结束后再修改岗位状态",
+		"code": "active_task_conflict",
+		"task_id": active.get("id"),
+	}, 409)
+
+
+@app.route("/api/jobs/soft-delete", method="POST")
+def api_jobs_soft_delete():
+	db = _get_web_db()
+	try:
+		body, job_ids = _job_action_payload()
+		with job_mutation_lock:
+			conflict = _active_task_mutation_error()
+			if conflict is not None:
+				return conflict
+			result = soft_delete_jobs(
+				db,
+				job_ids,
+				confirmed=body.get("confirmed") is True,
+				reason=str(body.get("reason") or "用户移入回收站"),
+			)
+		return _json_response(result)
+	except (ValueError, JobDeletionConflictError) as exc:
+		return _job_action_error(exc)
+	finally:
+		db.close()
+
+
+@app.route("/api/jobs/restore", method="POST")
+def api_jobs_restore():
+	db = _get_web_db()
+	try:
+		body, job_ids = _job_action_payload()
+		with job_mutation_lock:
+			conflict = _active_task_mutation_error()
+			if conflict is not None:
+				return conflict
+			result = restore_jobs(db, job_ids, confirmed=body.get("confirmed") is True)
+		return _json_response(result)
+	except (ValueError, JobDeletionConflictError) as exc:
+		return _job_action_error(exc)
+	finally:
+		db.close()
+
+
+@app.route("/api/jobs/manual-sent", method="POST")
+def api_jobs_manual_sent():
+	db = _get_web_db()
+	try:
+		body, job_ids = _job_action_payload()
+		with job_mutation_lock:
+			conflict = _active_task_mutation_error()
+			if conflict is not None:
+				return conflict
+			result = mark_external_jobs_sent(
+				db,
+				job_ids,
+				confirmed=body.get("confirmed") is True,
+			)
+		return _json_response(result)
+	except (ValueError, JobManualSentConflictError) as exc:
+		return _job_action_error(exc)
+	finally:
+		db.close()
+
+
+@app.route("/api/jobs/permanent-delete", method="POST")
+def api_jobs_permanent_delete():
+	db = _get_web_db()
+	try:
+		body, job_ids = _job_action_payload()
+		with job_mutation_lock:
+			conflict = _active_task_mutation_error()
+			if conflict is not None:
+				return conflict
+			result = permanent_delete_jobs(
+				db,
+				job_ids,
+				confirmed=body.get("confirmed") is True,
+				confirmation=body.get("confirmation", ""),
+			)
+		return _json_response(result)
+	except (ValueError, JobDeletionConflictError) as exc:
+		return _job_action_error(exc)
+	finally:
+		db.close()
+
+
+# ─── Resume APIs ─────────────────────────────────────────
+
+@app.route("/api/resume")
+def api_resume_get():
+	try:
+		config = load_config(CONFIG_PATH)
+		resume_path = config.get("profile", {}).get("resume_path", "")
+		if not resume_path or not str(resume_path).strip():
+			return _json_response(None)
+		configured = resolve_resume_filesystem_path(resume_path, BASE_DIR)
+		info = load_resume_info(configured)
+		if info is None:
+			# Default ./resume.md from config DEFAULTS is a placeholder, not an error.
+			if is_default_resume_placeholder(resume_path):
+				return _json_response(None)
+			return _json_response({"error": "配置的简历文件不存在或无法读取"}, 404)
+		canonical = str(info["path"])
+		if Path(canonical).resolve() != configured.resolve():
+			# Point AI/config at Markdown after PDF-only or legacy PDF paths.
+			config.setdefault("profile", {})["resume_path"] = canonical
+			_write_config(config)
+		return _json_response(info)
+	except ResumeUploadError as e:
+		return _json_response({"error": str(e)}, 400)
+	except Exception as e:
+		return _json_response({"error": str(e)}, 500)
+
+
+@app.route("/api/resume/original")
+def api_resume_original():
+	"""Serve the companion original PDF for in-panel preview."""
+	try:
+		config = load_config(CONFIG_PATH)
+		resume_path = config.get("profile", {}).get("resume_path", "")
+		# Match GET /api/resume: blank/whitespace means no resume configured.
+		if not resume_path or not str(resume_path).strip():
+			abort(404, "No resume configured")
+		configured = resolve_resume_filesystem_path(resume_path, BASE_DIR)
+		_, pdf_path = resolve_configured_resume_files(configured)
+		if not pdf_path.is_file():
+			abort(404, "Original PDF not found")
+		return static_file(pdf_path.name, root=str(pdf_path.parent), mimetype="application/pdf")
+	except HTTPResponse:
+		raise
+	except Exception as e:
+		return _json_response({"error": str(e)}, 500)
+
+
+
+@app.route("/api/resume/upload", method="POST")
+def api_resume_upload():
+	try:
+		upload = request.files.get("file")
+		if not upload:
+			return _json_response({"error": "No file uploaded"}, 400)
+
+		# Validate size (10MB max)
+		content = upload.file.read()
+		if len(content) > 10 * 1024 * 1024:
+			return _json_response({"error": "文件大小超过 10MB 限制"}, 400)
+
+		# Bottle's normalized `filename` strips non-ASCII characters. Use the
+		# raw browser filename and apply our own Unicode-safe sanitization.
+		raw_name = upload.raw_filename or upload.filename
+		safe_name, stored_content = prepare_resume_content(raw_name, content)
+		extracted_photo = extract_resume_photo(raw_name, content, max_bytes=RESUME_PHOTO_MAX_BYTES)
+		RESUME_DIR.mkdir(parents=True, exist_ok=True)
+		config = load_config(CONFIG_PATH)
+		active_path = resolve_active_resume_path(
+			config.get("profile", {}).get("resume_path") or None,
+			BASE_DIR,
+		)
+		final_name = select_resume_markdown_filename(
+			RESUME_DIR,
+			safe_name,
+			stored_content,
+			active_path,
+		)
+		dest = RESUME_DIR / final_name
+		original_pdf_bytes = content if upload_keeps_original_pdf(raw_name) else None
+		write_resume_artifacts(dest, stored_content, original_pdf_bytes=original_pdf_bytes)
+
+		# Always store an absolute path so AI/preflight can Path(...).exists() directly.
+		profile_config = config.setdefault("profile", {})
+		profile_config["resume_path"] = str(dest.resolve())
+		profile_config.pop("resume_generation_source", None)
+		profile_config.pop("resume_version_id", None)
+		_write_config(config)
+
+		info = build_resume_info_payload(
+			filename=final_name,
+			size=len(stored_content),
+			mtime=dest.stat().st_mtime,
+			content=stored_content.decode("utf-8"),
+			path=str(dest.resolve()),
+			has_original_pdf=original_pdf_bytes is not None,
+			original_pdf_path=str(dest.with_suffix(".pdf").resolve()) if original_pdf_bytes is not None else None,
+		)
+		try:
+			photo = _save_extracted_profile_photo(extracted_photo)
+		except Exception:
+			photo = None
+		return _json_response({"success": True, **info, "photo": _resume_photo_response(photo), "photo_extracted": bool(photo)})
+	except ResumeUploadError as e:
+		return _json_response({"error": str(e)}, 400)
+	except Exception as e:
+		return _json_response({"error": str(e)}, 500)
+
+
+@app.route("/api/resume", method="DELETE")
+def api_resume_delete():
+	try:
+		config = load_config(CONFIG_PATH)
+
+		# Detach from config always. Only drop the companion PDF when a Markdown
+		# master already exists — never force PDF→MD conversion here, or a bad
+		# PDF-only resume would block DELETE.
+		resume_path = config.get("profile", {}).get("resume_path", "")
+		if resume_path:
+			configured = resolve_resume_filesystem_path(resume_path, BASE_DIR)
+			markdown_path, pdf_path = resolve_configured_resume_files(configured)
+			if markdown_path.is_file() and pdf_path.is_file():
+				remove_companion_pdf(configured)
+
+		profile_config = config.setdefault("profile", {})
+		profile_config["resume_path"] = ""
+		profile_config.pop("resume_generation_source", None)
+		profile_config.pop("resume_version_id", None)
+		_write_config(config)
+
+		return _json_response({"success": True})
+	except ResumeUploadError as e:
+		return _json_response({"error": str(e)}, 400)
+	except Exception as e:
+		return _json_response({"error": str(e)}, 500)
+
+
+# ─── Resume Center APIs ──────────────────────────────────
+
+def _resume_center_body() -> dict:
+	body = request.json or {}
+	if not isinstance(body, dict):
+		raise ValueError("请求体必须是对象")
+	return body
+
+
+def _resume_center_result(callback, *, status_code: int = 200):
+	db = _get_web_db()
+	try:
+		return _json_response(callback(db), status_code)
+	except KeyError as exc:
+		return _json_response({"error": str(exc)}, 404)
+	except ValueError as exc:
+		return _json_response({"error": str(exc)}, 400)
+	except sqlite3.IntegrityError as exc:
+		return _json_response({"error": f"数据冲突：{exc}"}, 409)
+	except Exception as exc:
+		return _json_response({"error": str(exc)}, 500)
+	finally:
+		db.close()
+
+
+def _resume_photo_response(photo: dict | None):
+	if not photo:
+		return None
+	return {
+		**photo,
+		"image_url": f"/api/resume/photo/file?t={photo.get('created_at', '')}",
+	}
+
+
+def _resume_asset_dir() -> Path:
+	asset_dir = DATA_DIR / "resume_assets"
+	asset_dir.mkdir(parents=True, exist_ok=True)
+	return asset_dir
+
+
+def _remove_photo_file(photo: dict | None, *, keep_path: Path | None = None) -> None:
+	if not photo or not photo.get("path"):
+		return
+	path = Path(str(photo["path"]))
+	if keep_path is not None and path == keep_path:
+		return
+	if not path.exists():
+		return
+	try:
+		path.unlink()
+	except OSError:
+		pass
+
+
+def _content_matches_photo_type(content: bytes, mime_type: str) -> bool:
+	if mime_type == "image/jpeg":
+		return content.startswith(b"\xff\xd8")
+	if mime_type == "image/png":
+		return content.startswith(b"\x89PNG\r\n\x1a\n")
+	if mime_type == "image/webp":
+		return content.startswith(b"RIFF") and content[8:12] == b"WEBP"
+	return False
+
+
+def _save_profile_photo_content(content: bytes, mime_type: str, suffix: str, db=None) -> dict:
+	asset_dir = _resume_asset_dir()
+	dest = asset_dir / f"profile_photo_{uuid4().hex}{suffix}"
+	dest.write_bytes(content)
+
+	owned_db = db is None
+	if owned_db:
+		db = _get_web_db()
+	try:
+		old_photo = resume_center.get_profile_photo(db)
+		photo = resume_center.save_profile_photo(db, str(dest.resolve()), mime_type, len(content))
+	finally:
+		if owned_db:
+			db.close()
+	_remove_photo_file(old_photo, keep_path=dest)
+	return photo
+
+
+def _save_extracted_profile_photo(photo: ExtractedResumePhoto | None) -> dict | None:
+	if not photo:
+		return None
+	return _save_profile_photo_content(photo.content, photo.mime_type, photo.suffix)
+
+
+def _import_photo_candidate_response(filename: str, mime_type: str, file_size: int) -> dict:
+	return {
+		"filename": filename,
+		"mime_type": mime_type,
+		"file_size": file_size,
+		"image_url": f"/api/resume/import-photo-preview/{filename}?t={int(time.time())}",
+	}
+
+
+def _save_import_photo_candidate(photo: ExtractedResumePhoto | None) -> dict | None:
+	if not photo:
+		return None
+	filename = f"{RESUME_IMPORT_PHOTO_PREFIX}{uuid4().hex}{photo.suffix}"
+	dest = _resume_asset_dir() / filename
+	dest.write_bytes(photo.content)
+	return _import_photo_candidate_response(filename, photo.mime_type, len(photo.content))
+
+
+def _import_photo_candidate_path(filename: str) -> Path:
+	name = Path(str(filename or "")).name
+	if not name.startswith(RESUME_IMPORT_PHOTO_PREFIX):
+		raise ValueError("照片候选文件无效")
+	if Path(name).suffix.lower() not in {".jpg", ".jpeg", ".png", ".webp"}:
+		raise ValueError("照片候选文件格式无效")
+	path = (_resume_asset_dir() / name).resolve()
+	root = _resume_asset_dir().resolve()
+	if path.parent != root:
+		raise ValueError("照片候选文件路径无效")
+	return path
+
+
+def _promote_import_photo_candidate(candidate: dict | None, db=None) -> dict | None:
+	if not isinstance(candidate, dict):
+		return None
+	filename = str(candidate.get("filename") or "")
+	if not filename:
+		return None
+	path = _import_photo_candidate_path(filename)
+	if not path.is_file():
+		return None
+	content = path.read_bytes()
+	if not content or len(content) > RESUME_PHOTO_MAX_BYTES:
+		return None
+	mime_type = str(candidate.get("mime_type") or "").split(";", 1)[0].strip().lower()
+	if mime_type not in RESUME_PHOTO_TYPES:
+		return None
+	if not _content_matches_photo_type(content, mime_type):
+		return None
+	saved = _save_profile_photo_content(content, mime_type, RESUME_PHOTO_TYPES[mime_type], db=db)
+	try:
+		path.unlink()
+	except OSError:
+		pass
+	return saved
+
+
+@app.route("/api/resume/center")
+def api_resume_center_get():
+	def get_center(db):
+		payload = resume_center.get_resume_center(db)
+		payload["photo"] = _resume_photo_response(payload.get("photo"))
+		return payload
+
+	return _resume_center_result(get_center)
+
+
+@app.route("/api/resume/center/reset", method="POST")
+def api_resume_center_reset():
+	def reset(db):
+		result = resume_center.reset_resume_center(db)
+		for raw_path in result.pop("asset_paths", []):
+			path = Path(str(raw_path))
+			if path.exists():
+				try:
+					path.unlink()
+				except OSError:
+					pass
+		asset_dir = DATA_DIR / "resume_assets"
+		if asset_dir.is_dir():
+			for path in asset_dir.iterdir():
+				if path.is_file() and (
+					path.name.startswith("profile_photo_")
+					or path.name.startswith(RESUME_IMPORT_PHOTO_PREFIX)
+				):
+					try:
+						path.unlink()
+					except OSError:
+						pass
+		result["center"]["photo"] = _resume_photo_response(result["center"].get("photo"))
+		return result
+
+	return _resume_center_result(reset)
+
+
+@app.route("/api/resume/import-preview", method="POST")
+def api_resume_import_preview():
+	try:
+		upload = request.files.get("file")
+		if not upload:
+			return _json_response({"error": "请选择要导入的旧简历"}, 400)
+		content = upload.file.read()
+		if not content:
+			return _json_response({"error": "旧简历文件为空"}, 400)
+		if len(content) > 10 * 1024 * 1024:
+			return _json_response({"error": "文件大小超过 10MB 限制"}, 400)
+		raw_name = upload.raw_filename or upload.filename
+		safe_name, stored_content = prepare_resume_content(raw_name, content)
+		markdown = stored_content.decode("utf-8")
+		draft = build_resume_import_preview(safe_name, markdown, config=load_config(CONFIG_PATH))
+		try:
+			draft["photo_candidate"] = _save_import_photo_candidate(
+				extract_resume_photo(raw_name, content, max_bytes=RESUME_PHOTO_MAX_BYTES)
+			)
+		except Exception:
+			draft["photo_candidate"] = None
+		return _json_response(draft)
+	except ResumeUploadError as exc:
+		return _json_response({"error": str(exc)}, 400)
+	except ValueError as exc:
+		return _json_response({"error": str(exc)}, 400)
+	except Exception as exc:
+		return _json_response({"error": str(exc)}, 500)
+
+
+@app.route("/api/resume/import-confirm", method="POST")
+def api_resume_import_confirm():
+	body = _resume_center_body()
+	draft = body.get("draft")
+	if not isinstance(draft, dict):
+		return _json_response({"error": "导入草稿不能为空"}, 400)
+	photo_candidate = draft.get("photo_candidate")
+
+	def confirm(db):
+		result = apply_resume_import_draft(db, draft)
+		photo = _promote_import_photo_candidate(photo_candidate, db=db)
+		result["photo"] = _resume_photo_response(photo)
+		return result
+
+	return _resume_center_result(confirm)
+
+
+@app.route("/api/resume/template-import-preview", method="POST")
+def api_resume_template_import_preview():
+	try:
+		upload = request.files.get("file")
+		if not upload:
+			return _json_response({"error": "请选择要导入的模板文件"}, 400)
+		content = upload.file.read()
+		if not content:
+			return _json_response({"error": "模板文件为空"}, 400)
+		if len(content) > 10 * 1024 * 1024:
+			return _json_response({"error": "文件大小超过 10MB 限制"}, 400)
+		raw_name = upload.raw_filename or upload.filename
+		safe_name, stored_content = prepare_resume_content(raw_name, content)
+		return _json_response(build_template_import_preview(safe_name, stored_content.decode("utf-8")))
+	except ResumeUploadError as exc:
+		return _json_response({"error": str(exc)}, 400)
+	except ValueError as exc:
+		return _json_response({"error": str(exc)}, 400)
+	except Exception as exc:
+		return _json_response({"error": str(exc)}, 500)
+
+
+@app.route("/api/resume/template-import-confirm", method="POST")
+def api_resume_template_import_confirm():
+	body = _resume_center_body()
+	draft = body.get("draft")
+	if not isinstance(draft, dict):
+		return _json_response({"error": "模板草稿不能为空"}, 400)
+	return _resume_center_result(lambda db: create_template_from_import_draft(db, draft), status_code=201)
+
+
+@app.route("/api/resume/profile")
+def api_resume_profile_get():
+	return _resume_center_result(resume_center.get_profile)
+
+
+@app.route("/api/resume/profile", method="PUT")
+def api_resume_profile_update():
+	return _resume_center_result(lambda db: resume_center.update_profile(db, _resume_center_body()))
+
+
+@app.route("/api/resume/photo")
+def api_resume_photo_get():
+	return _resume_center_result(lambda db: _resume_photo_response(resume_center.get_profile_photo(db)))
+
+
+@app.route("/api/resume/import-photo-preview/<filename>")
+def api_resume_import_photo_preview(filename):
+	try:
+		path = _import_photo_candidate_path(filename)
+	except ValueError as exc:
+		abort(404, str(exc))
+	if not path.is_file():
+		abort(404, "Resume import photo candidate not found")
+	mime_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+	return static_file(path.name, root=str(path.parent), mimetype=mime_type)
+
+
+@app.route("/api/resume/photo", method="POST")
+def api_resume_photo_upload():
+	try:
+		upload = request.files.get("file")
+		if not upload:
+			return _json_response({"error": "请选择要上传的照片"}, 400)
+		content = upload.file.read()
+		if not content:
+			return _json_response({"error": "照片文件为空"}, 400)
+		if len(content) > RESUME_PHOTO_MAX_BYTES:
+			return _json_response({"error": "照片大小超过 5MB 限制"}, 400)
+		mime_type = str(upload.content_type or "").split(";", 1)[0].strip().lower()
+		if mime_type not in RESUME_PHOTO_TYPES:
+			return _json_response({"error": "仅支持 JPG、PNG 或 WebP 照片"}, 400)
+		if mime_type == "image/jpeg" and not content.startswith(b"\xff\xd8"):
+			return _json_response({"error": "照片内容不是有效的 JPG 文件"}, 400)
+		if mime_type == "image/png" and not content.startswith(b"\x89PNG\r\n\x1a\n"):
+			return _json_response({"error": "照片内容不是有效的 PNG 文件"}, 400)
+		if mime_type == "image/webp" and not (content.startswith(b"RIFF") and content[8:12] == b"WEBP"):
+			return _json_response({"error": "照片内容不是有效的 WebP 文件"}, 400)
+
+		photo = _save_profile_photo_content(content, mime_type, RESUME_PHOTO_TYPES[mime_type])
+		return _json_response({"success": True, "photo": _resume_photo_response(photo)})
+	except ValueError as exc:
+		return _json_response({"error": str(exc)}, 400)
+	except Exception as exc:
+		return _json_response({"error": str(exc)}, 500)
+
+
+@app.route("/api/resume/photo", method="DELETE")
+def api_resume_photo_delete():
+	db = _get_web_db()
+	try:
+		photo = resume_center.delete_profile_photo(db)
+	finally:
+		db.close()
+	if photo and photo.get("path"):
+		path = Path(str(photo["path"]))
+		if path.exists():
+			try:
+				path.unlink()
+			except OSError:
+				pass
+	return _json_response({"success": True})
+
+
+@app.route("/api/resume/photo/file")
+def api_resume_photo_file():
+	db = _get_web_db()
+	try:
+		photo = resume_center.get_profile_photo(db)
+	finally:
+		db.close()
+	if not photo or not photo.get("path"):
+		abort(404, "No resume photo configured")
+	path = Path(str(photo["path"]))
+	if not path.is_file():
+		abort(404, "Resume photo not found")
+	return static_file(path.name, root=str(path.parent), mimetype=photo.get("mime_type") or None)
+
+
+@app.route("/api/resume/sections")
+def api_resume_sections_get():
+	return _resume_center_result(resume_center.list_sections)
+
+
+@app.route("/api/resume/sections", method="POST")
+def api_resume_sections_create():
+	return _resume_center_result(lambda db: resume_center.create_section(db, _resume_center_body()), status_code=201)
+
+
+@app.route("/api/resume/sections/<section_id>", method="PUT")
+def api_resume_sections_update(section_id):
+	return _resume_center_result(lambda db: resume_center.update_section(db, section_id, _resume_center_body()))
+
+
+@app.route("/api/resume/sections/<section_id>", method="DELETE")
+def api_resume_sections_delete(section_id):
+	def delete(db):
+		resume_center.delete_section(db, section_id)
+		return {"success": True}
+
+	return _resume_center_result(delete)
+
+
+@app.route("/api/resume/entries", method="POST")
+def api_resume_entries_create():
+	return _resume_center_result(lambda db: resume_center.create_entry(db, _resume_center_body()), status_code=201)
+
+
+@app.route("/api/resume/entries/<entry_id>")
+def api_resume_entries_get(entry_id):
+	return _resume_center_result(lambda db: resume_center.get_entry(db, entry_id))
+
+
+@app.route("/api/resume/entries/<entry_id>", method="PUT")
+def api_resume_entries_update(entry_id):
+	return _resume_center_result(lambda db: resume_center.update_entry(db, entry_id, _resume_center_body()))
+
+
+@app.route("/api/resume/entries/<entry_id>", method="DELETE")
+def api_resume_entries_delete(entry_id):
+	def delete(db):
+		resume_center.delete_entry(db, entry_id)
+		return {"success": True}
+
+	return _resume_center_result(delete)
+
+
+@app.route("/api/resume/materials", method="POST")
+def api_resume_materials_create():
+	return _resume_center_result(lambda db: resume_center.create_material(db, _resume_center_body()), status_code=201)
+
+
+@app.route("/api/resume/materials/<material_id>")
+def api_resume_materials_get(material_id):
+	return _resume_center_result(lambda db: resume_center.get_material(db, material_id))
+
+
+@app.route("/api/resume/materials/<material_id>", method="PUT")
+def api_resume_materials_update(material_id):
+	return _resume_center_result(lambda db: resume_center.update_material(db, material_id, _resume_center_body()))
+
+
+@app.route("/api/resume/materials/<material_id>", method="DELETE")
+def api_resume_materials_delete(material_id):
+	def delete(db):
+		resume_center.delete_material(db, material_id)
+		return {"success": True}
+
+	return _resume_center_result(delete)
+
+
+@app.route("/api/resume/templates")
+def api_resume_templates_get():
+	return _resume_center_result(resume_center.list_templates)
+
+
+@app.route("/api/resume/templates", method="POST")
+def api_resume_templates_create():
+	return _resume_center_result(lambda db: resume_center.create_template(db, _resume_center_body()), status_code=201)
+
+
+@app.route("/api/resume/templates/<template_id>", method="DELETE")
+def api_resume_templates_delete(template_id):
+	def delete(db):
+		resume_center.delete_template(db, template_id)
+		return {"success": True}
+
+	return _resume_center_result(delete)
+
+
+@app.route("/api/resume/versions")
+def api_resume_versions_get():
+	return _resume_center_result(resume_center.list_versions)
+
+
+@app.route("/api/resume/versions", method="POST")
+def api_resume_versions_create():
+	return _resume_center_result(lambda db: resume_center.create_version(db, _resume_center_body()), status_code=201)
+
+
+@app.route("/api/resume/versions/duplicate", method="POST")
+def api_resume_versions_duplicate_body():
+	body = _resume_center_body()
+	version_id = str(body.get("version_id") or "").strip()
+	if not version_id:
+		return _json_response({"error": "version_id 不能为空"}, 400)
+	return _resume_center_result(
+		lambda db: resume_center.duplicate_version(db, version_id, body),
+		status_code=201,
+	)
+
+
+@app.route("/api/resume/export-pdf")
+def api_resume_export_pdf():
+	version_id = str(request.query.get("version_id") or "").strip()
+	if not version_id:
+		return _json_response({"error": "version_id 不能为空"}, 400)
+	template_id = str(request.query.get("template_id") or "").strip() or None
+	show_photo = str(request.query.get("show_photo") or "1").strip().lower() not in {"0", "false", "no"}
+	db = _get_web_db()
+	try:
+		version = resume_center.get_version(db, version_id)
+		if template_id:
+			snapshot = dict(version.get("profile_snapshot") or {})
+			snapshot["template"] = resume_center.get_template(db, template_id)
+			version = {**version, "profile_snapshot": snapshot}
+	finally:
+		db.close()
+	try:
+		pdf_path = export_resume_version_pdf(
+			version,
+			DATA_DIR / "resume_exports",
+			template_id=template_id,
+			show_photo=show_photo,
+		)
+	except KeyError as exc:
+		return _json_response({"error": str(exc)}, 404)
+	except Exception as exc:
+		return _json_response({"error": str(exc)}, 500)
+	return static_file(
+		pdf_path.name,
+		root=str(pdf_path.parent),
+		mimetype="application/pdf",
+		download=pdf_path.name,
+	)
+
+
+@app.route("/api/resume/use-version", method="POST")
+def api_resume_use_version():
+	try:
+		body = _resume_center_body()
+		version_id = str(body.get("version_id") or "").strip()
+		if not version_id:
+			return _json_response({"error": "version_id 不能为空"}, 400)
+
+		db = _get_web_db()
+		try:
+			version = resume_center.get_version(db, version_id)
+		finally:
+			db.close()
+
+		markdown = resume_version_markdown(version)
+		markdown_bytes = markdown.encode("utf-8")
+		RESUME_DIR.mkdir(parents=True, exist_ok=True)
+		filename = resume_version_markdown_filename(version)
+		dest = RESUME_DIR / filename
+		write_resume_artifacts(dest, markdown_bytes, original_pdf_bytes=None)
+
+		config = load_config(CONFIG_PATH)
+		profile_config = config.setdefault("profile", {})
+		profile_config["resume_path"] = str(dest.resolve())
+		profile_config["resume_generation_source"] = "resume_center_version"
+		profile_config["resume_version_id"] = version_id
+		_write_config(config)
+
+		db = _get_web_db()
+		try:
+			resume_center.update_version(
+				db,
+				version_id,
+				{
+					**version,
+					"rendered_markdown": markdown,
+					"status": "ready",
+				},
+			)
+		finally:
+			db.close()
+
+		info = build_resume_info_payload(
+			filename=filename,
+			size=len(markdown_bytes),
+			mtime=dest.stat().st_mtime,
+			content=markdown,
+			path=str(dest.resolve()),
+			has_original_pdf=False,
+		)
+		return _json_response({"success": True, "version_id": version_id, **info})
+	except KeyError as exc:
+		return _json_response({"error": str(exc)}, 404)
+	except ValueError as exc:
+		return _json_response({"error": str(exc)}, 400)
+	except Exception as exc:
+		return _json_response({"error": str(exc)}, 500)
+
+
+@app.route("/api/resume/customize-from-job", method="POST")
+def api_resume_customize_from_job():
+	try:
+		body = _resume_center_body()
+		job_id = str(body.get("job_id") or "").strip()
+		if not job_id:
+			return _json_response({"error": "job_id 不能为空"}, 400)
+		template_id = str(body.get("template_id") or "").strip() or None
+		version_name = str(body.get("version_name") or "").strip() or None
+		db = _get_web_db()
+		try:
+			jobs, _ = query_jobs(db, deleted="all", job_ids=[job_id], limit=1, offset=0)
+			if not jobs:
+				return _json_response({"error": "岗位不存在"}, 404)
+			if template_id:
+				resume_center.get_template(db, template_id)
+			return _json_response(
+				create_resume_version_for_job(
+					db,
+					jobs[0],
+					template_id=template_id,
+					version_name=version_name,
+				),
+				201,
+			)
+		finally:
+			db.close()
+	except KeyError as exc:
+		return _json_response({"error": str(exc)}, 404)
+	except ValueError as exc:
+		return _json_response({"error": str(exc)}, 400)
+	except Exception as exc:
+		return _json_response({"error": str(exc)}, 500)
+
+
+@app.route("/api/resume/versions/<version_id>/duplicate", method="POST")
+def api_resume_versions_duplicate(version_id):
+	return _resume_center_result(
+		lambda db: resume_center.duplicate_version(db, version_id, _resume_center_body()),
+		status_code=201,
+	)
+
+
+@app.route("/api/resume/versions/<version_id>")
+def api_resume_versions_detail(version_id):
+	return _resume_center_result(lambda db: resume_center.get_version(db, version_id))
+
+
+@app.route("/api/resume/versions/<version_id>", method="PUT")
+def api_resume_versions_update(version_id):
+	return _resume_center_result(lambda db: resume_center.update_version(db, version_id, _resume_center_body()))
+
+
+@app.route("/api/resume/versions/<version_id>", method="DELETE")
+def api_resume_versions_delete(version_id):
+	def delete(db):
+		resume_center.delete_version(db, version_id)
+		return {"success": True}
+
+	return _resume_center_result(delete)
+
+
+# ─── Static Files + SPA Fallback ─────────────────────────
+
+_STATIC_MIME_TYPES = {
+	".css": "text/css; charset=utf-8",
+	".cjs": "text/javascript; charset=utf-8",
+	".html": "text/html; charset=utf-8",
+	".js": "application/javascript; charset=utf-8",
+	".json": "application/json; charset=utf-8",
+	".mjs": "application/javascript; charset=utf-8",
+	".svg": "image/svg+xml",
+}
+
+
+def _serve_static(filename: str, root: Path):
+	"""Serve static assets with stable MIME types while retaining range/cache support.
+
+	Reads the file bytes directly instead of relying on ``bottle.static_file``,
+	which gates on ``os.access(..., os.R_OK)``. On macOS (sandboxed/TCC-restricted
+	processes) that check can report a false 403 denial even though the file is
+	actually readable, which makes the dashboard fail to load.
+	"""
+	file_path = (root / filename).resolve()
+	resolved_root = root.resolve()
+	if str(file_path).startswith(str(resolved_root)):
+		try:
+			data = file_path.read_bytes()
+		except OSError:
+			pass
+		else:
+			mimetype = _STATIC_MIME_TYPES.get(Path(filename).suffix.lower(), "auto")
+			if mimetype == "auto":
+				mimetype, _ = mimetypes.guess_type(filename)
+			response.content_type = mimetype or "application/octet-stream"
+			response.headers["Content-Length"] = str(len(data))
+			return data
+
+	return static_file(filename, root=str(root), mimetype="auto")
+
+
+@app.route("/assets/<filepath:path>")
+def serve_assets(filepath):
+	return _serve_static(filepath, FRONTEND_DIR / "assets")
+
+
+@app.route("/")
+@app.route("/<filepath:path>")
+def serve_spa(filepath="index.html"):
+	if str(filepath).startswith("api/"):
+		return _json_response({"error": "Not found"}, 404)
+
+	# Try serving the exact file first
+	file_path = FRONTEND_DIR / filepath
+	if file_path.is_file():
+		return _serve_static(filepath, FRONTEND_DIR)
+	# SPA fallback: return index.html for all non-API routes
+	return _serve_static("index.html", FRONTEND_DIR)
+
+
+# ─── Error Handlers ──────────────────────────────────────
+
+@app.error(404)
+def error404(error):
+	if request.path.startswith("/api/"):
+		response.content_type = "application/json; charset=utf-8"
+		return json.dumps({"error": "Not found"}, ensure_ascii=False)
+	# SPA fallback for non-API 404s
+	return _serve_static("index.html", FRONTEND_DIR)
+
+
+@app.error(500)
+def error500(error):
+	response.content_type = "application/json; charset=utf-8"
+	return json.dumps({"error": str(error.body)}, ensure_ascii=False)
+
+
+# ─── Run ─────────────────────────────────────────────────
+
+def run_server(host: str = "127.0.0.1", port: int = 8686, open_browser: bool = True):
+	"""Start the web server."""
+	if not (FRONTEND_DIR / "index.html").is_file():
+		raise SystemExit(
+			"前端资源未构建：请在 src/bosshunter/web/frontend 下执行 "
+			"`npm ci && npm run build`（或安装官方发布的 wheel）后重试。"
+		)
+
+	if open_browser:
+		import webbrowser
+		import threading
+		def _open():
+			time.sleep(1)
+			webbrowser.open(f"http://{host}:{port}")
+		threading.Thread(target=_open, daemon=True).start()
+
+	app.run(
+		host=host,
+		port=port,
+		quiet=False,
+		reloader=False,
+		server_class=ThreadingWSGIServer,
+	)

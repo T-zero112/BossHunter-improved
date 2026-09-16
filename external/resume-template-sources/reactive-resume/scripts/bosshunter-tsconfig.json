@@ -1,0 +1,6 @@
+{
+	"extends": "../packages/pdf/tsconfig.json",
+	"compilerOptions": {
+		"jsx": "react-jsx"
+	}
+}
